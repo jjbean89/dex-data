@@ -2,6 +2,7 @@ import { config } from "../config.js";
 import { sleep } from "../hl/client.js";
 import { log, logErr } from "../log.js";
 import { syncFunding } from "./funding.js";
+import { startPositionsTracker } from "./positions.js";
 import { pruneOldData } from "./retention.js";
 import { bootstrapRollups, runIncrementalRollups } from "./rollups.js";
 import { collectTick } from "./ticks.js";
@@ -92,14 +93,15 @@ export function startCollector(): () => Promise<void> {
   }
 
   const loops = [tickLoop(), rollupLoop(), fundingLoop(), retentionLoop()];
+  const stopPositions = config.positionsEnabled ? startPositionsTracker(isStopped) : null;
   log(
     "collector",
-    `started: poll ${config.pollIntervalMs}ms, funding sweep every ${Math.round(config.fundingSyncIntervalMs / 60_000)}min, backfill ${config.fundingBackfillDays}d`,
+    `started: poll ${config.pollIntervalMs}ms, funding sweep every ${Math.round(config.fundingSyncIntervalMs / 60_000)}min, backfill ${config.fundingBackfillDays}d, positions ${config.positionsEnabled ? "on" : "off"}`,
   );
 
   return async () => {
     stopped = true;
-    await Promise.allSettled(loops);
+    await Promise.allSettled([...loops, ...(stopPositions ? [stopPositions()] : [])]);
     log("collector", "stopped");
   };
 }

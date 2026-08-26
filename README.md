@@ -6,8 +6,9 @@ Custom Hyperliquid market data service. Hyperliquid's public API only exposes th
 - **Open interest history** — per-coin and venue-wide OI candles (this data exists nowhere in HL's API; it only exists if you record it)
 - **Funding history** — settled hourly rates (synced from HL back to whatever backfill depth you choose) plus recorded live rates
 - **Venue-wide aggregates** — total OI candles and OI-weighted average funding, the "Aggregated Open Interest" / "Aggregated Funding Rate" style series
+- **Long/short trader counts** — how many wallets are long vs. short each coin, with change over time (derived from the public trade tape + per-wallet position tracking; this exists in no API anywhere)
 
-One process polls `metaAndAssetCtxs` (every live perp in a single request) every 15s, rolls ticks up into 5m/1h candles, and prunes raw data on a retention schedule. A second process serves a read-only JSON API.
+One process polls `metaAndAssetCtxs` (every live perp in a single request) every 15s, rolls ticks up into 5m/1h candles, prunes raw data on a retention schedule, and runs the trades-WebSocket position tracker. A second process serves a read-only JSON API.
 
 ```
 ┌───────────┐   POST /info every 15s    ┌───────────┐        ┌───────────┐
@@ -69,6 +70,11 @@ Deploys are zero-drama: the collector shuts down gracefully on SIGTERM and the D
 | `ROLLUP_INTERVAL_MS` | `60000` | Candle rollup cadence |
 | `RAW_RETENTION_DAYS` | `14` | Raw tick retention — also the max `window` on `/changes` |
 | `CANDLES_5M_RETENTION_DAYS` | `180` | 5m candle retention (1h candles are kept forever) |
+| `POSITIONS_ENABLED` | `true` | Long/short trader tracking (trades WebSocket + position ledger) |
+| `HL_WS_URL` | `wss://api.hyperliquid.xyz/ws` | Trades feed |
+| `POSITIONS_SNAPSHOT_MS` | `300000` | Long/short snapshot cadence (resolution of the history series) |
+| `BOOTSTRAP_DELAY_MS` | `400` | Pacing between clearinghouseState wallet lookups |
+| `POSITIONS_FLUSH_MS` / `REVERIFY_INTERVAL_MS` / `REVERIFY_BATCH` | `1000` / `6h` / `2000` | Fill-delta write cadence; self-heal sweep |
 | `PG_SSL_NO_VERIFY` | `false` | Accept self-signed Postgres TLS (Railway public proxy) |
 
 ## API
@@ -105,6 +111,22 @@ Venue totals right now: `totalOiUsd`, `oiUsdChangePct1h/24h`, OI-weighted fundin
 ### `GET /v1/market/funding?interval=1h&smooth=8h`
 **OI-weighted average funding series**, optionally smoothed with a trailing mean (`smooth=8h` reproduces the classic "8h average" view of HL's hourly rates).
 
+### `GET /v1/perps/:coin/positioning` · `/positioning/history` · `GET /v1/perps/positioning`
+**Number of traders long vs. short**, per coin. Nowhere in Hyperliquid's API — derived here by tracking every wallet seen on the public trade tape (each fill names buyer and seller), bootstrapping its true positions via `clearinghouseState`, then maintaining them from fills. Snapshots freeze the counts every 5 minutes; `/history` serves that series (your change-over-time), the coin endpoint adds 1h/24h deltas inline, and the bare `/positioning` lists all coins.
+
+```json
+{ "coin": "BTC", "t": "2026-08-26T16:10:00.000Z", "nLong": 412, "nShort": 268, "nTraders": 680,
+  "pctLong": 60.6, "longShortRatio": 1.54, "szLong": 18342.1, "szShort": 12007.9,
+  "ntlLongUsd": 1431201852.2, "ntlShortUsd": 936914233.8, "netNtlUsd": 494287618.4,
+  "tradersTracked": 9184, "coverage": { "tracked": 9184, "pending": 1201 },
+  "changes": { "1h": { "nLongDelta": 18, "nShortDelta": -5, "pctLongDelta": 1.2, ... }, "24h": null } }
+```
+
+Honest semantics — read this before charting it:
+- **Coverage grows over time.** A wallet enters the ledger the first time it trades after the tracker starts; its *full* position set (all coins, including dormant ones) is captured at bootstrap. Counts therefore climb steeply in the first days as the active-trader universe is discovered, then settle into real signal. `tradersTracked` / `coverage` tell you how mature the dataset is — early on, chart `pctLong` (composition) rather than raw counts.
+- A wallet that never trades after launch is invisible until it does. Every wallet counts once (vaults and market makers included; note HLP itself is one wallet).
+- Positions are maintained from fills with the `[buyer, seller]` convention (verified empirically: 29/33 exact matches to 1e-9 against clearinghouseState, remainder explained by in-flight fills). WebSocket gaps trigger automatic re-baselining of recently active wallets, and a rolling re-verify sweep re-checks the longest-unverified wallets — drift self-heals within hours.
+
 ### `GET /health`
 `{ok, lastTickAt, tickAgeSec, ticksStale, liveCoins}` — wire this to Railway's healthcheck.
 
@@ -123,5 +145,5 @@ Venue totals right now: `totalOiUsd`, `oiUsdChangePct1h/24h`, OI-weighted fundin
 - **Cross-venue funding** — `predictedFundings` returns HL vs Binance vs Bybit rates + intervals per coin → funding-arb endpoints.
 - **Leaderboards & signals** — OI-up-price-down divergence, funding flips, new-listing alerts; all derivable from existing tables.
 - **Gap repair** — backfill price candles from HL `candleSnapshot` after downtime (1m ≈ 3.5d retained upstream, 1h ≈ 208d).
-- **Liquidation tape** — WebSocket trades firehose (separate operational footprint).
+- **Liquidation tape** — the trades firehose is already ingested for position tracking; flagging and aggregating liquidation fills is an increment on top.
 - **Third-party hardening** — API keys + per-key rate limits, OpenAPI spec, SSE/WS push.

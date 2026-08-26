@@ -4,19 +4,25 @@ import { pool } from "../db/pool.js";
 import {
   changesBundle,
   fundingRows,
+  latestPositioning,
+  latestPositioningFor,
   latestTicks,
   marketCandles,
   marketOiCloseAt,
   perpCandles,
   perpList,
+  positioningAt,
+  positioningHistory,
   resolveCoin,
   singleTick,
   toleranceFor,
+  trackerCoverage,
   type CandleInterval,
   type ChangeRow,
   type ChangesBundle,
   type MarketCandleRow,
   type PerpCandleRow,
+  type PositioningRow,
 } from "./queries.js";
 import { aprPct, cached, parseLimit, parseTimeMs, parseWindow, pctChange, rollingMean } from "./util.js";
 
@@ -39,6 +45,16 @@ function noRecentData(reply: FastifyReply): FastifyReply {
   return reply
     .code(503)
     .send({ error: { code: "no_recent_data", message: "no ticks recorded in the last 3 minutes — collector down or still warming up" } });
+}
+
+function positioningWarmingUp(reply: FastifyReply, coverage: { tracked: number; pending: number }): FastifyReply {
+  return reply.code(503).send({
+    error: {
+      code: "no_positioning_data",
+      message: "no positioning snapshots yet — the tracker is discovering and bootstrapping wallets",
+    },
+    coverage,
+  });
 }
 
 function getChanges(windowMs: number): Promise<ChangesBundle> {
@@ -93,6 +109,28 @@ function serializePerpCandle(r: PerpCandleRow): Record<string, unknown> {
   };
 }
 
+function serializePositioning(r: PositioningRow, includeCoin: boolean): Record<string, unknown> {
+  const n = r.n_long + r.n_short;
+  const ntlLong = r.ntl_long;
+  const ntlShort = r.ntl_short;
+  return {
+    ...(includeCoin ? { coin: r.coin } : {}),
+    t: r.ts.toISOString(),
+    tMs: r.ts.getTime(),
+    nLong: r.n_long,
+    nShort: r.n_short,
+    nTraders: n,
+    pctLong: n > 0 ? (r.n_long / n) * 100 : null,
+    longShortRatio: r.n_short > 0 ? r.n_long / r.n_short : null,
+    szLong: r.sz_long,
+    szShort: r.sz_short,
+    ntlLongUsd: ntlLong,
+    ntlShortUsd: ntlShort,
+    netNtlUsd: ntlLong !== null && ntlShort !== null ? ntlLong - ntlShort : null,
+    tradersTracked: r.traders_tracked,
+  };
+}
+
 function serializeMarketCandle(r: MarketCandleRow): Record<string, unknown> {
   return {
     t: r.t.toISOString(),
@@ -117,6 +155,9 @@ export function registerRoutes(app: FastifyInstance): void {
       "GET /v1/perps/:coin",
       "GET /v1/perps/:coin/candles?interval=5m|1h|1d&from=&to=&limit=300",
       "GET /v1/perps/:coin/funding-history?from=&to=&limit=168",
+      "GET /v1/perps/positioning?sort=traders|pctLong&dir=desc&limit=250",
+      "GET /v1/perps/:coin/positioning",
+      "GET /v1/perps/:coin/positioning/history?from=&to=&limit=288",
       "GET /v1/market/snapshot",
       "GET /v1/market/oi?interval=5m|1h|1d&from=&to=&limit=300",
       "GET /v1/market/funding?interval=1h&smooth=8h&from=&to=&limit=300",
@@ -214,6 +255,83 @@ export function registerRoutes(app: FastifyInstance): void {
       count: data.length,
       data,
     };
+  });
+
+  app.get("/v1/perps/positioning", async (req, reply) => {
+    const q = req.query as Query;
+    const sortRaw = q.sort ?? "traders";
+    const sorters: Record<string, (r: PositioningRow) => number> = {
+      traders: (r) => r.n_long + r.n_short,
+      pctLong: (r) => (r.n_long + r.n_short > 0 ? r.n_long / (r.n_long + r.n_short) : 0),
+    };
+    const sorter = sorters[sortRaw];
+    if (!sorter) return bad(reply, `invalid sort "${sortRaw}" — use traders|pctLong`);
+    const dir = q.dir ?? "desc";
+    if (dir !== "asc" && dir !== "desc") return bad(reply, 'dir must be "asc" or "desc"');
+    const limit = parseLimit(q.limit, 250, 500);
+    if (limit === null) return bad(reply, "invalid limit");
+
+    const { rows, coverage } = await cached("positioning:latest", 30_000, async () => ({
+      rows: await latestPositioning(),
+      coverage: await trackerCoverage(),
+    }));
+    if (rows.length === 0) return positioningWarmingUp(reply, coverage);
+    const sign = dir === "desc" ? -1 : 1;
+    const data = [...rows].sort((a, b) => (sorter(a) - sorter(b)) * sign).slice(0, limit);
+    return { count: data.length, coverage, data: data.map((r) => serializePositioning(r, true)) };
+  });
+
+  app.get("/v1/perps/:coin/positioning", async (req, reply) => {
+    const { coin: coinRaw } = req.params as { coin: string };
+    const asset = await resolveCoin(coinRaw);
+    if (!asset) return notFound(reply, `no perp named "${coinRaw}"`);
+    const [latest, coverage] = await Promise.all([latestPositioningFor(asset.coin), trackerCoverage()]);
+    if (!latest) return positioningWarmingUp(reply, coverage);
+    const now = Date.now();
+    const [ago1h, ago24h] = await Promise.all([
+      positioningAt(asset.coin, now - 3_600_000),
+      positioningAt(asset.coin, now - 86_400_000),
+    ]);
+    const changeVs = (then: PositioningRow | null): Record<string, unknown> | null => {
+      if (!then) return null;
+      const cur = serializePositioning(latest, false);
+      const prev = serializePositioning(then, false);
+      return {
+        tMs: then.ts.getTime(),
+        nLongThen: then.n_long,
+        nShortThen: then.n_short,
+        nLongDelta: latest.n_long - then.n_long,
+        nShortDelta: latest.n_short - then.n_short,
+        pctLongThen: prev.pctLong,
+        pctLongDelta:
+          typeof cur.pctLong === "number" && typeof prev.pctLong === "number"
+            ? (cur.pctLong as number) - (prev.pctLong as number)
+            : null,
+      };
+    };
+    return {
+      coin: asset.coin,
+      ...serializePositioning(latest, false),
+      coverage,
+      changes: { "1h": changeVs(ago1h), "24h": changeVs(ago24h) },
+    };
+  });
+
+  app.get("/v1/perps/:coin/positioning/history", async (req, reply) => {
+    const { coin: coinRaw } = req.params as { coin: string };
+    const asset = await resolveCoin(coinRaw);
+    if (!asset) return notFound(reply, `no perp named "${coinRaw}"`);
+    const q = req.query as Query;
+    const limit = parseLimit(q.limit, 288, CANDLE_LIMIT_MAX);
+    if (limit === null) return bad(reply, "invalid limit");
+    const from = parseTimeMs(q.from);
+    const to = parseTimeMs(q.to);
+    if (from === null || to === null) return bad(reply, "invalid from/to — use epoch ms, epoch seconds, or an ISO timestamp");
+    const toMs = to ?? Date.now() + 60_000;
+    const fromMs = from ?? toMs - limit * config.positionsSnapshotMs;
+    if (fromMs >= toMs) return bad(reply, "from must be before to");
+    const rows = await positioningHistory(asset.coin, fromMs, toMs, limit);
+    return { coin: asset.coin, count: rows.length, data: rows.map((r) => serializePositioning(r, false)) };
   });
 
   app.get("/v1/perps/:coin", async (req, reply) => {

@@ -31,6 +31,24 @@ export interface FundingHistoryEntry {
   time: number;
 }
 
+export interface AssetPosition {
+  type: string; // "oneWay"
+  position: {
+    coin: string;
+    szi: string; // signed size in coins: >0 long, <0 short
+    entryPx?: string;
+    positionValue?: string;
+    unrealizedPnl?: string;
+    leverage?: { type: string; value: number };
+  };
+}
+
+export interface ClearinghouseState {
+  assetPositions: AssetPosition[];
+  marginSummary?: { accountValue: string; totalNtlPos: string };
+  time: number;
+}
+
 export interface Candle {
   t: number; // bucket open time (ms)
   T: number; // bucket close time (ms)
