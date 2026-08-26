@@ -4,6 +4,7 @@ import { log, logErr } from "../log.js";
 import { syncFunding } from "./funding.js";
 import { startPositionsTracker } from "./positions.js";
 import { pruneOldData } from "./retention.js";
+import { runSeeder, shouldSeed } from "./seed-hypertracker.js";
 import { bootstrapRollups, runIncrementalRollups } from "./rollups.js";
 import { collectTick } from "./ticks.js";
 
@@ -93,6 +94,11 @@ export function startCollector(): () => Promise<void> {
   }
 
   const loops = [tickLoop(), rollupLoop(), fundingLoop(), retentionLoop()];
+  if (config.positionsEnabled && shouldSeed()) {
+    loops.push(
+      runSeeder(isStopped).catch((err: unknown) => logErr("seed", "seeder crashed", err)),
+    );
+  }
   const stopPositions = config.positionsEnabled ? startPositionsTracker(isStopped) : null;
   log(
     "collector",

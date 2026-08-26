@@ -47,7 +47,10 @@ function noRecentData(reply: FastifyReply): FastifyReply {
     .send({ error: { code: "no_recent_data", message: "no ticks recorded in the last 3 minutes — collector down or still warming up" } });
 }
 
-function positioningWarmingUp(reply: FastifyReply, coverage: { tracked: number; pending: number }): FastifyReply {
+function positioningWarmingUp(
+  reply: FastifyReply,
+  coverage: { tracked: number; pending: number; provisional: number },
+): FastifyReply {
   return reply.code(503).send({
     error: {
       code: "no_positioning_data",

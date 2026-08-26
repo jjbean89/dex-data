@@ -75,6 +75,8 @@ Deploys are zero-drama: the collector shuts down gracefully on SIGTERM and the D
 | `POSITIONS_SNAPSHOT_MS` | `300000` | Long/short snapshot cadence (resolution of the history series) |
 | `BOOTSTRAP_DELAY_MS` | `400` | Pacing between clearinghouseState wallet lookups |
 | `POSITIONS_FLUSH_MS` / `REVERIFY_INTERVAL_MS` / `REVERIFY_BATCH` | `1000` / `6h` / `2000` | Fill-delta write cadence; self-heal sweep |
+| `HYPERTRACKER_API_KEY` | — | Enables the one-time starting-census import (see positioning docs below) |
+| `HYPERTRACKER_BASE_URL` / `HYPERTRACKER_REQ_DELAY_MS` | `https://ht-api.coinmarketman.com/api` / `1500` | Census source + pacing |
 | `PG_SSL_NO_VERIFY` | `false` | Accept self-signed Postgres TLS (Railway public proxy) |
 
 ## API
@@ -122,8 +124,10 @@ Venue totals right now: `totalOiUsd`, `oiUsdChangePct1h/24h`, OI-weighted fundin
   "changes": { "1h": { "nLongDelta": 18, "nShortDelta": -5, "pctLongDelta": 1.2, ... }, "24h": null } }
 ```
 
+**Starting census via HyperTracker (optional, recommended):** tape discovery alone misses wallets that opened positions before launch and haven't traded since. Set `HYPERTRACKER_API_KEY` ([get one here](https://app.coinmarketman.com/hypertracker/api)) and the collector runs a one-time import of every open position per coin from [HyperTracker's](https://docs.coinmarketman.com/) snapshot API (CSV export, ~1 request per coin, resumable per coin across restarts — see `seed_progress`). Imported positions are **provisional**: every seeded wallet stays queued for verification, and the bootstrapper progressively replaces the imported rows with Hyperliquid's official `clearinghouseState` (tape-active wallets keep queue priority; already-verified wallets are never touched by a seed). The `coverage.provisional` field in API responses tracks how much of the census is still awaiting verification. Check HyperTracker's pricing/terms for your usage — especially if you redistribute derived data.
+
 Honest semantics — read this before charting it:
-- **Coverage grows over time.** A wallet enters the ledger the first time it trades after the tracker starts; its *full* position set (all coins, including dormant ones) is captured at bootstrap. Counts therefore climb steeply in the first days as the active-trader universe is discovered, then settle into real signal. `tradersTracked` / `coverage` tell you how mature the dataset is — early on, chart `pctLong` (composition) rather than raw counts.
+- **Coverage grows over time.** A wallet enters the ledger the first time it trades after the tracker starts (or via the census seed above); its *full* position set (all coins, including dormant ones) is captured at bootstrap. Without a seed, counts climb steeply in the first days as the active-trader universe is discovered, then settle into real signal. `tradersTracked` / `coverage` tell you how mature the dataset is — early on, chart `pctLong` (composition) rather than raw counts.
 - A wallet that never trades after launch is invisible until it does. Every wallet counts once (vaults and market makers included; note HLP itself is one wallet).
 - Positions are maintained from fills with the `[buyer, seller]` convention (verified empirically: 29/33 exact matches to 1e-9 against clearinghouseState, remainder explained by in-flight fills). WebSocket gaps trigger automatic re-baselining of recently active wallets, and a rolling re-verify sweep re-checks the longest-unverified wallets — drift self-heals within hours.
 

@@ -368,13 +368,17 @@ export async function positioningAt(coin: string, targetMs: number): Promise<Pos
   return rows[0] ?? null;
 }
 
-export async function trackerCoverage(): Promise<{ tracked: number; pending: number }> {
-  const { rows } = await pool.query<{ tracked: number; pending: number }>(
-    `select (count(*) filter (where not bootstrap_pending))::int as tracked,
-            (count(*) filter (where bootstrap_pending))::int as pending
+export async function trackerCoverage(): Promise<{ tracked: number; pending: number; provisional: number }> {
+  const { rows } = await pool.query<{ tracked: number; pending: number; provisional: number }>(
+    `select
+       (count(*) filter (where not bootstrap_pending))::int as tracked,
+       (count(*) filter (where bootstrap_pending))::int as pending,
+       (select count(distinct p.address)
+          from positions p join traders t on t.address = p.address
+          where t.bootstrapped_at is null)::int as provisional
      from traders`,
   );
-  return rows[0] ?? { tracked: 0, pending: 0 };
+  return rows[0] ?? { tracked: 0, pending: 0, provisional: 0 };
 }
 
 // Venue OI (close) at or just before the target time, for market snapshot change math.
