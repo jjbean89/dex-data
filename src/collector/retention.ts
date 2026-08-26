@@ -1,0 +1,17 @@
+import { config } from "../config.js";
+import { pool } from "../db/pool.js";
+
+// Raw ticks and 5m candles are bounded; 1h candles (per-coin and venue-wide) are the
+// permanent record and are never pruned.
+export async function pruneOldData(): Promise<{ ticks: number; candles5m: number }> {
+  const t = await pool.query("delete from perp_ticks where ts < now() - make_interval(days => $1)", [
+    config.rawRetentionDays,
+  ]);
+  const c1 = await pool.query("delete from perp_candles_5m where t < now() - make_interval(days => $1)", [
+    config.candles5mRetentionDays,
+  ]);
+  const c2 = await pool.query("delete from market_candles_5m where t < now() - make_interval(days => $1)", [
+    config.candles5mRetentionDays,
+  ]);
+  return { ticks: t.rowCount ?? 0, candles5m: (c1.rowCount ?? 0) + (c2.rowCount ?? 0) };
+}
