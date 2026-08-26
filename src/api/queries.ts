@@ -315,14 +315,15 @@ export interface PositioningRow {
   coin: string;
   n_long: number;
   n_short: number;
-  sz_long: number;
-  sz_short: number;
+  sz_long: number | null;
+  sz_short: number | null;
   ntl_long: number | null;
   ntl_short: number | null;
-  traders_tracked: number;
+  traders_tracked: number | null;
+  source: string; // 'live' (our ledger) or 'hypertracker' (backfilled history)
 }
 
-const POSITIONING_COLS = "ts, coin, n_long, n_short, sz_long, sz_short, ntl_long, ntl_short, traders_tracked";
+const POSITIONING_COLS = "ts, coin, n_long, n_short, sz_long, sz_short, ntl_long, ntl_short, traders_tracked, source";
 
 export async function latestPositioning(): Promise<PositioningRow[]> {
   const { rows } = await pool.query<PositioningRow>(
@@ -368,13 +369,17 @@ export async function positioningAt(coin: string, targetMs: number): Promise<Pos
   return rows[0] ?? null;
 }
 
-export async function trackerCoverage(): Promise<{ tracked: number; pending: number }> {
-  const { rows } = await pool.query<{ tracked: number; pending: number }>(
-    `select (count(*) filter (where not bootstrap_pending))::int as tracked,
-            (count(*) filter (where bootstrap_pending))::int as pending
+export async function trackerCoverage(): Promise<{ tracked: number; pending: number; provisional: number }> {
+  const { rows } = await pool.query<{ tracked: number; pending: number; provisional: number }>(
+    `select
+       (count(*) filter (where not bootstrap_pending))::int as tracked,
+       (count(*) filter (where bootstrap_pending))::int as pending,
+       (select count(distinct p.address)
+          from positions p join traders t on t.address = p.address
+          where t.bootstrapped_at is null)::int as provisional
      from traders`,
   );
-  return rows[0] ?? { tracked: 0, pending: 0 };
+  return rows[0] ?? { tracked: 0, pending: 0, provisional: 0 };
 }
 
 // Venue OI (close) at or just before the target time, for market snapshot change math.

@@ -32,6 +32,11 @@ export const config = {
   reverifyIntervalMs: numEnv("REVERIFY_INTERVAL_MS", 21_600_000),
   reverifyBatch: numEnv("REVERIFY_BATCH", 2_000),
 
+  // HyperTracker census seed (optional; runs once when a key is present).
+  hypertrackerApiKey: process.env.HYPERTRACKER_API_KEY ?? "",
+  hypertrackerBaseUrl: process.env.HYPERTRACKER_BASE_URL ?? "https://ht-api.coinmarketman.com/api",
+  hypertrackerReqDelayMs: numEnv("HYPERTRACKER_REQ_DELAY_MS", 1_500),
+
   pgSslNoVerify: process.env.PG_SSL_NO_VERIFY === "true",
 };
 
