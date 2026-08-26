@@ -1,0 +1,39 @@
+function numEnv(name: string, def: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return def;
+  const v = Number(raw);
+  if (!Number.isFinite(v)) throw new Error(`env ${name} must be a number, got "${raw}"`);
+  return v;
+}
+
+export type Role = "all" | "api" | "collector";
+
+export const config = {
+  role: (process.env.ROLE ?? "all") as Role,
+  databaseUrl: process.env.DATABASE_URL ?? "",
+  hlApiUrl: process.env.HL_API_URL ?? "https://api.hyperliquid.xyz",
+  port: numEnv("PORT", 3000),
+  host: process.env.HOST ?? "0.0.0.0",
+
+  pollIntervalMs: numEnv("POLL_INTERVAL_MS", 15_000),
+  fundingSyncIntervalMs: numEnv("FUNDING_SYNC_INTERVAL_MS", 3_600_000),
+  fundingReqDelayMs: numEnv("FUNDING_REQ_DELAY_MS", 2_000),
+  fundingBackfillDays: numEnv("FUNDING_BACKFILL_DAYS", 30),
+  rollupIntervalMs: numEnv("ROLLUP_INTERVAL_MS", 60_000),
+  rawRetentionDays: numEnv("RAW_RETENTION_DAYS", 14),
+  candles5mRetentionDays: numEnv("CANDLES_5M_RETENTION_DAYS", 180),
+
+  pgSslNoVerify: process.env.PG_SSL_NO_VERIFY === "true",
+};
+
+export function assertConfig(): void {
+  if (!config.databaseUrl) {
+    throw new Error("DATABASE_URL is required (postgres://user:pass@host:port/db)");
+  }
+  if (!["all", "api", "collector"].includes(config.role)) {
+    throw new Error(`ROLE must be one of all|api|collector, got "${config.role}"`);
+  }
+  if (config.pollIntervalMs < 2_000) {
+    throw new Error("POLL_INTERVAL_MS below 2000ms would burn the Hyperliquid rate-limit budget");
+  }
+}
