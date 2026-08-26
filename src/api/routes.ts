@@ -131,6 +131,7 @@ function serializePositioning(r: PositioningRow, includeCoin: boolean): Record<s
     ntlShortUsd: ntlShort,
     netNtlUsd: ntlLong !== null && ntlShort !== null ? ntlLong - ntlShort : null,
     tradersTracked: r.traders_tracked,
+    source: r.source,
   };
 }
 

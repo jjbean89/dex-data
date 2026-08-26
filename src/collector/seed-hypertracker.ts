@@ -17,11 +17,15 @@ import { log, logErr } from "../log.js";
 // idempotent across restarts.
 
 const SOURCE = "hypertracker";
+const HISTORY_SOURCE = "hypertracker-history";
 const REQUEST_TIMEOUT_MS = 120_000;
 const IMPORT_CHUNK = 10_000;
 const MAX_COIN_FAILURES = 10;
 
 class AuthError extends Error {}
+// Persistent 429s — on the free tier the daily quota resets; we stop cleanly and
+// resume on a later boot instead of burning requests.
+class QuotaError extends Error {}
 
 interface SeedRow {
   address: string;
@@ -44,22 +48,42 @@ export async function runSeeder(isStopped: () => boolean): Promise<void> {
   }
   if (isStopped()) return;
 
-  const { rows: todo } = await pool.query<{ coin: string }>(
+  try {
+    await censusPass(isStopped);
+    await historyPass(isStopped);
+  } catch (err) {
+    if (err instanceof AuthError) {
+      logErr("seed", "hypertracker API key rejected — aborting. Fix HYPERTRACKER_API_KEY and redeploy; imports resume automatically");
+    } else if (err instanceof QuotaError) {
+      log("seed", "hypertracker request quota exhausted — pausing. Imports resume on the next boot (the free tier's 100 req/day quota resets daily; a paid tier finishes in one pass)");
+    } else {
+      throw err;
+    }
+  }
+}
+
+async function pendingCoins(source: string): Promise<string[]> {
+  const { rows } = await pool.query<{ coin: string }>(
     `select a.coin from perp_assets a
      where a.is_delisted = false
        and not exists (select 1 from seed_progress s where s.source = $1 and s.coin = a.coin)
      order by a.coin`,
-    [SOURCE],
+    [source],
   );
+  return rows.map((r) => r.coin);
+}
+
+async function censusPass(isStopped: () => boolean): Promise<void> {
+  const todo = await pendingCoins(SOURCE);
   if (todo.length === 0) {
-    log("seed", "hypertracker census already imported (seed_progress complete)");
+    log("seed", "hypertracker census already imported");
     return;
   }
   log("seed", `hypertracker census import starting: ${todo.length} coins`);
 
   let failures = 0;
   let loggedFields = false;
-  for (const { coin } of todo) {
+  for (const coin of todo) {
     if (isStopped()) return;
     try {
       const { rows, sampleFields } = await fetchOpenPositions(coin);
@@ -76,20 +100,56 @@ export async function runSeeder(isStopped: () => boolean): Promise<void> {
       );
       log("seed", `${coin}: ${imported} provisional positions imported (${wallets} wallets in snapshot)`);
     } catch (err) {
-      if (err instanceof AuthError) {
-        logErr("seed", "hypertracker API key rejected — aborting seed. Fix HYPERTRACKER_API_KEY and redeploy; the seed resumes automatically");
-        return;
-      }
+      if (err instanceof AuthError || err instanceof QuotaError) throw err;
       failures++;
       logErr("seed", `${coin} failed (${failures}/${MAX_COIN_FAILURES})`, err);
       if (failures >= MAX_COIN_FAILURES) {
-        logErr("seed", "too many failures — stopping; remaining coins retry on next boot");
+        logErr("seed", "too many census failures — stopping; remaining coins retry on next boot");
         return;
       }
     }
     await sleepFor(config.hypertrackerReqDelayMs, isStopped);
   }
   log("seed", "hypertracker census import finished");
+}
+
+// Import HyperTracker's 2h-sampled long/short count history into
+// positioning_snapshots (source='hypertracker') — the change-over-time series
+// from before this service existed. Live rows are never overwritten.
+async function historyPass(isStopped: () => boolean): Promise<void> {
+  const todo = await pendingCoins(HISTORY_SOURCE);
+  if (todo.length === 0) {
+    log("seed", "hypertracker count history already imported");
+    return;
+  }
+  log("seed", `hypertracker count-history import starting: ${todo.length} coins`);
+
+  let failures = 0;
+  for (const coin of todo) {
+    if (isStopped()) return;
+    try {
+      const rows = await fetchMetricsHistory(coin);
+      const imported = await importHistory(coin, rows);
+      await pool.query(
+        `insert into seed_progress (source, coin, wallets, rows_imported) values ($1, $2, 0, $3)
+         on conflict (source, coin) do update set
+           completed_at = now(), rows_imported = excluded.rows_imported`,
+        [HISTORY_SOURCE, coin, imported],
+      );
+      const oldest = rows.length > 0 ? rows.reduce((m, r) => (r.ts < m ? r.ts : m), rows[0]!.ts) : null;
+      log("seed", `${coin}: ${imported} historical snapshots imported${oldest ? ` (back to ${oldest.toISOString().slice(0, 10)})` : ""}`);
+    } catch (err) {
+      if (err instanceof AuthError || err instanceof QuotaError) throw err;
+      failures++;
+      logErr("seed", `${coin} history failed (${failures}/${MAX_COIN_FAILURES})`, err);
+      if (failures >= MAX_COIN_FAILURES) {
+        logErr("seed", "too many history failures — stopping; remaining coins retry on next boot");
+        return;
+      }
+    }
+    await sleepFor(config.hypertrackerReqDelayMs, isStopped);
+  }
+  log("seed", "hypertracker count-history import finished");
 }
 
 async function fetchOpenPositions(coin: string): Promise<{ rows: SeedRow[]; sampleFields: string | null }> {
@@ -195,6 +255,105 @@ function parseCsv(text: string): Array<Record<string, unknown>> {
     .map((r) => Object.fromEntries(keys.map((k, i) => [k, r[i] ?? ""])));
 }
 
+interface HistRow {
+  ts: Date;
+  nLong: number;
+  nShort: number;
+  szLong: number | null;
+  szShort: number | null;
+  ntlLong: number | null;
+  ntlShort: number | null;
+}
+
+// GET /external/exports/coins/{coin}/position-metrics → {coin, metrics: {columns, data}}.
+// Note the docs' format quirk: `columns` starts with "coin" but data rows omit it
+// (the coin lives at the top level), so column mapping detects the offset.
+async function fetchMetricsHistory(coin: string): Promise<HistRow[]> {
+  const url = `${config.hypertrackerBaseUrl}/external/exports/coins/${encodeURIComponent(coin)}/position-metrics`;
+  const res = await httpGet(url, { Authorization: `Bearer ${config.hypertrackerApiKey}` });
+  const parsed: unknown = JSON.parse(await res.text());
+  const presigned = findPresignedUrl(parsed);
+  if (presigned) {
+    const fileRes = await httpGet(presigned, {});
+    if (!fileRes.ok) throw new Error(`presigned fetch: HTTP ${fileRes.status}`);
+    return parseMetricsExport(JSON.parse(await fileRes.text()));
+  }
+  return parseMetricsExport(parsed);
+}
+
+function parseMetricsExport(body: unknown): HistRow[] {
+  const root = isRecord(body) ? body : {};
+  const metrics = isRecord(root.metrics) ? root.metrics : root;
+  const columns = Array.isArray(metrics.columns) ? (metrics.columns as unknown[]).map(String) : null;
+  const data = Array.isArray(metrics.data) ? (metrics.data as unknown[]) : null;
+  if (!columns || !data) throw new Error("unexpected position-metrics export format");
+  const firstRow = data.find((r) => Array.isArray(r)) as unknown[] | undefined;
+  let cols = columns;
+  if (firstRow && firstRow.length === columns.length - 1 && columns[0]?.toLowerCase() === "coin") {
+    cols = columns.slice(1);
+  }
+  const idx = (name: string): number => cols.findIndex((c) => c.toLowerCase() === name.toLowerCase());
+  const iTs = idx("timestamp");
+  const iCount = idx("positionCount");
+  const iLong = idx("positionCountLong");
+  const iVal = idx("totalPositionValue");
+  const iValLong = idx("totalPositionValueLong");
+  const iSz = idx("totalPositionSize");
+  const iSzLong = idx("totalPositionSizeLong");
+  if (iTs < 0 || iCount < 0 || iLong < 0) {
+    throw new Error(`position-metrics export missing expected columns: ${cols.join(", ")}`);
+  }
+  const rows: HistRow[] = [];
+  for (const raw of data) {
+    if (!Array.isArray(raw)) continue;
+    const tsMs = typeof raw[iTs] === "string" ? Date.parse(raw[iTs] as string) : NaN;
+    const count = toNum(raw[iCount]);
+    const nLong = toNum(raw[iLong]);
+    if (!Number.isFinite(tsMs) || count === null || nLong === null || nLong > count || nLong < 0) continue;
+    const val = iVal >= 0 ? toNum(raw[iVal]) : null;
+    const valLong = iValLong >= 0 ? toNum(raw[iValLong]) : null;
+    const sz = iSz >= 0 ? toNum(raw[iSz]) : null;
+    const szLong = iSzLong >= 0 ? toNum(raw[iSzLong]) : null;
+    rows.push({
+      ts: new Date(tsMs),
+      nLong: Math.round(nLong),
+      nShort: Math.round(count - nLong),
+      szLong,
+      szShort: sz !== null && szLong !== null ? sz - szLong : null,
+      ntlLong: valLong,
+      ntlShort: val !== null && valLong !== null ? val - valLong : null,
+    });
+  }
+  return rows;
+}
+
+async function importHistory(coin: string, rows: HistRow[]): Promise<number> {
+  let imported = 0;
+  for (let i = 0; i < rows.length; i += IMPORT_CHUNK) {
+    const chunk = rows.slice(i, i + IMPORT_CHUNK);
+    const res = await pool.query(
+      `insert into positioning_snapshots
+         (ts, coin, n_long, n_short, sz_long, sz_short, ntl_long, ntl_short, traders_tracked, source)
+       select u.ts, $2, u.n_long, u.n_short, u.sz_long, u.sz_short, u.ntl_long, u.ntl_short, null, 'hypertracker'
+       from unnest($1::timestamptz[], $3::int[], $4::int[], $5::float8[], $6::float8[], $7::float8[], $8::float8[])
+         as u(ts, n_long, n_short, sz_long, sz_short, ntl_long, ntl_short)
+       on conflict (coin, ts) do nothing`,
+      [
+        chunk.map((r) => r.ts),
+        coin,
+        chunk.map((r) => r.nLong),
+        chunk.map((r) => r.nShort),
+        chunk.map((r) => r.szLong),
+        chunk.map((r) => r.szShort),
+        chunk.map((r) => r.ntlLong),
+        chunk.map((r) => r.ntlShort),
+      ],
+    );
+    imported += res.rowCount ?? 0;
+  }
+  return imported;
+}
+
 const ADDR_KEYS = ["address", "wallet", "user", "walletAddress", "wallet_address", "owner", "trader", "account"];
 const COIN_KEYS = ["coin", "symbol", "asset", "market", "pair"];
 const SIGNED_KEYS = ["szi", "signedSize", "signed_size", "netSize", "net_size"];
@@ -250,8 +409,12 @@ function mapRawRows(
 function toSeedRow(reqCoin: string, raw: Record<string, unknown>): SeedRow | null {
   const addr = pick(raw, ADDR_KEYS);
   if (typeof addr !== "string" || !/^0x[0-9a-fA-F]{40}$/.test(addr.trim())) return null;
+  // The snapshot covers HIP-3 builder exchanges too (per their docs, `dex` field);
+  // our ledger tracks the main DEX only — same-symbol positions elsewhere are separate markets.
+  const dex = pick(raw, ["dex", "exchange", "venue"]);
+  if (typeof dex === "string" && dex !== "" && dex.toLowerCase() !== "main") return null;
   const rowCoin = pick(raw, COIN_KEYS);
-  // Skip rows for other symbols (e.g. HIP-3 builder exchanges) — we key by main-DEX coins.
+  // Skip rows for other symbols — we key by main-DEX coins.
   if (typeof rowCoin === "string" && rowCoin !== "" && rowCoin.toUpperCase() !== reqCoin.toUpperCase()) return null;
   let szi = toNum(pick(raw, SIGNED_KEYS));
   if (szi === null) {
@@ -304,6 +467,7 @@ async function importRows(coin: string, rows: SeedRow[]): Promise<{ wallets: num
 
 async function httpGet(url: string, headers: Record<string, string>): Promise<Response> {
   let lastErr: unknown;
+  let sawRateLimit = false;
   for (let attempt = 0; attempt <= 3; attempt++) {
     if (attempt > 0) await sleep(5_000 * attempt);
     const controller = new AbortController();
@@ -312,9 +476,21 @@ async function httpGet(url: string, headers: Record<string, string>): Promise<Re
       const res = await fetch(url, { headers, signal: controller.signal });
       if (res.status === 401 || res.status === 403) throw new AuthError(`HTTP ${res.status}`);
       if (res.status === 429) {
-        const ra = parseInt(res.headers.get("retry-after") ?? "", 10);
+        sawRateLimit = true;
+        // Their limiter returns retry_after (header or JSON body); a short value is a
+        // per-minute limit worth waiting out, a long one means the quota is spent.
+        let retryAfterSec = parseInt(res.headers.get("retry-after") ?? "", 10);
+        if (!Number.isFinite(retryAfterSec)) {
+          try {
+            const body = (await res.json()) as { retry_after?: number };
+            if (typeof body.retry_after === "number") retryAfterSec = body.retry_after;
+          } catch {
+            /* ignore */
+          }
+        }
+        if (Number.isFinite(retryAfterSec) && retryAfterSec > 300) throw new QuotaError(`retry_after ${retryAfterSec}s`);
         lastErr = new Error("HTTP 429");
-        await sleep(Number.isFinite(ra) && ra > 0 ? ra * 1000 : 30_000);
+        await sleep(Number.isFinite(retryAfterSec) && retryAfterSec > 0 ? retryAfterSec * 1000 : 30_000);
         continue;
       }
       if (res.status >= 500) {
@@ -324,12 +500,13 @@ async function httpGet(url: string, headers: Record<string, string>): Promise<Re
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return res;
     } catch (err) {
-      if (err instanceof AuthError) throw err;
+      if (err instanceof AuthError || err instanceof QuotaError) throw err;
       lastErr = err;
     } finally {
       clearTimeout(timer);
     }
   }
+  if (sawRateLimit) throw new QuotaError("rate limit persisted through retries");
   throw lastErr instanceof Error ? lastErr : new Error(`request failed: ${url}`);
 }
 
