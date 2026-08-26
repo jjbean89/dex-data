@@ -23,6 +23,15 @@ export const config = {
   rawRetentionDays: numEnv("RAW_RETENTION_DAYS", 14),
   candles5mRetentionDays: numEnv("CANDLES_5M_RETENTION_DAYS", 180),
 
+  // Long/short trader tracking (trades WebSocket + per-wallet position ledger).
+  positionsEnabled: process.env.POSITIONS_ENABLED !== "false",
+  hlWsUrl: process.env.HL_WS_URL ?? "wss://api.hyperliquid.xyz/ws",
+  positionsFlushMs: numEnv("POSITIONS_FLUSH_MS", 1_000),
+  bootstrapDelayMs: numEnv("BOOTSTRAP_DELAY_MS", 400),
+  positionsSnapshotMs: numEnv("POSITIONS_SNAPSHOT_MS", 300_000),
+  reverifyIntervalMs: numEnv("REVERIFY_INTERVAL_MS", 21_600_000),
+  reverifyBatch: numEnv("REVERIFY_BATCH", 2_000),
+
   pgSslNoVerify: process.env.PG_SSL_NO_VERIFY === "true",
 };
 

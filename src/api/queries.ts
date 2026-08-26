@@ -310,6 +310,73 @@ export async function fundingRows(
   return rows.reverse();
 }
 
+export interface PositioningRow {
+  ts: Date;
+  coin: string;
+  n_long: number;
+  n_short: number;
+  sz_long: number;
+  sz_short: number;
+  ntl_long: number | null;
+  ntl_short: number | null;
+  traders_tracked: number;
+}
+
+const POSITIONING_COLS = "ts, coin, n_long, n_short, sz_long, sz_short, ntl_long, ntl_short, traders_tracked";
+
+export async function latestPositioning(): Promise<PositioningRow[]> {
+  const { rows } = await pool.query<PositioningRow>(
+    `select distinct on (coin) ${POSITIONING_COLS}
+     from positioning_snapshots order by coin, ts desc`,
+  );
+  return rows;
+}
+
+export async function latestPositioningFor(coin: string): Promise<PositioningRow | null> {
+  const { rows } = await pool.query<PositioningRow>(
+    `select ${POSITIONING_COLS} from positioning_snapshots
+     where coin = $1 order by ts desc limit 1`,
+    [coin],
+  );
+  return rows[0] ?? null;
+}
+
+export async function positioningHistory(
+  coin: string,
+  fromMs: number,
+  toMs: number,
+  limit: number,
+): Promise<PositioningRow[]> {
+  const { rows } = await pool.query<PositioningRow>(
+    `select ${POSITIONING_COLS} from positioning_snapshots
+     where coin = $1 and ts >= to_timestamp($2 / 1000.0) and ts < to_timestamp($3 / 1000.0)
+     order by ts desc limit $4`,
+    [coin, fromMs, toMs, limit],
+  );
+  return rows.reverse();
+}
+
+// Snapshot at or just before the target time (for change-over-window math).
+export async function positioningAt(coin: string, targetMs: number): Promise<PositioningRow | null> {
+  const { rows } = await pool.query<PositioningRow>(
+    `select ${POSITIONING_COLS} from positioning_snapshots
+     where coin = $1 and ts <= to_timestamp($2 / 1000.0)
+       and ts >= to_timestamp($2 / 1000.0) - interval '45 minutes'
+     order by ts desc limit 1`,
+    [coin, targetMs],
+  );
+  return rows[0] ?? null;
+}
+
+export async function trackerCoverage(): Promise<{ tracked: number; pending: number }> {
+  const { rows } = await pool.query<{ tracked: number; pending: number }>(
+    `select (count(*) filter (where not bootstrap_pending))::int as tracked,
+            (count(*) filter (where bootstrap_pending))::int as pending
+     from traders`,
+  );
+  return rows[0] ?? { tracked: 0, pending: 0 };
+}
+
 // Venue OI (close) at or just before the target time, for market snapshot change math.
 export async function marketOiCloseAt(targetMs: number): Promise<number | null> {
   const { rows } = await pool.query<{ oi_usd_c: number | null }>(
