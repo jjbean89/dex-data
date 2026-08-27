@@ -37,6 +37,19 @@ export function shouldSeed(): boolean {
   return config.hypertrackerApiKey !== "";
 }
 
+// True once every live coin has completed both the census and history imports.
+export async function seedComplete(): Promise<boolean> {
+  const { rows } = await pool.query<{ missing: number }>(
+    `select count(*)::int as missing
+     from perp_assets a
+     cross join (values ($1::text), ($2::text)) as src(source)
+     where a.is_delisted = false
+       and not exists (select 1 from seed_progress s where s.source = src.source and s.coin = a.coin)`,
+    [SOURCE, HISTORY_SOURCE],
+  );
+  return (rows[0]?.missing ?? 0) === 0;
+}
+
 export async function runSeeder(isStopped: () => boolean): Promise<void> {
   // Wait for the asset registry (populated by the first tick).
   while (!isStopped()) {

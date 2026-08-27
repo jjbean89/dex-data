@@ -4,7 +4,7 @@ import { log, logErr } from "../log.js";
 import { syncFunding } from "./funding.js";
 import { startPositionsTracker } from "./positions.js";
 import { pruneOldData } from "./retention.js";
-import { runSeeder, shouldSeed } from "./seed-hypertracker.js";
+import { runSeeder, seedComplete, shouldSeed } from "./seed-hypertracker.js";
 import { bootstrapRollups, runIncrementalRollups } from "./rollups.js";
 import { collectTick } from "./ticks.js";
 
@@ -93,11 +93,27 @@ export function startCollector(): () => Promise<void> {
     }
   }
 
+  // Seed imports retry on an interval, not just at boot: API quota windows
+  // (e.g. HyperTracker's free-tier daily reset) pass without a redeploy.
+  async function seedLoop(): Promise<void> {
+    while (!stopped) {
+      try {
+        await runSeeder(isStopped);
+        if (await seedComplete()) {
+          log("seed", "all imports complete");
+          return;
+        }
+        log("seed", `imports incomplete — retrying in ${Math.round(config.hypertrackerRetryMs / 3_600_000)}h`);
+      } catch (err) {
+        logErr("seed", "seeder crashed — retrying later", err);
+      }
+      await pauseUntil(Date.now() + config.hypertrackerRetryMs);
+    }
+  }
+
   const loops = [tickLoop(), rollupLoop(), fundingLoop(), retentionLoop()];
   if (config.positionsEnabled && shouldSeed()) {
-    loops.push(
-      runSeeder(isStopped).catch((err: unknown) => logErr("seed", "seeder crashed", err)),
-    );
+    loops.push(seedLoop());
   }
   const stopPositions = config.positionsEnabled ? startPositionsTracker(isStopped) : null;
   log(

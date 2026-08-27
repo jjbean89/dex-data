@@ -36,6 +36,7 @@ export const config = {
   hypertrackerApiKey: process.env.HYPERTRACKER_API_KEY ?? "",
   hypertrackerBaseUrl: process.env.HYPERTRACKER_BASE_URL ?? "https://ht-api.coinmarketman.com/api",
   hypertrackerReqDelayMs: numEnv("HYPERTRACKER_REQ_DELAY_MS", 1_500),
+  hypertrackerRetryMs: numEnv("HYPERTRACKER_RETRY_MS", 10_800_000),
 
   pgSslNoVerify: process.env.PG_SSL_NO_VERIFY === "true",
 };
