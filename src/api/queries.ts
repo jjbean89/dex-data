@@ -358,15 +358,19 @@ export async function positioningHistory(
 }
 
 // Snapshot at or just before the target time (for change-over-window math).
+// Falls back to a wider window so 2h-sampled backfilled history still qualifies.
 export async function positioningAt(coin: string, targetMs: number): Promise<PositioningRow | null> {
-  const { rows } = await pool.query<PositioningRow>(
-    `select ${POSITIONING_COLS} from positioning_snapshots
-     where coin = $1 and ts <= to_timestamp($2 / 1000.0)
-       and ts >= to_timestamp($2 / 1000.0) - interval '45 minutes'
-     order by ts desc limit 1`,
-    [coin, targetMs],
-  );
-  return rows[0] ?? null;
+  for (const tolerance of ["45 minutes", "130 minutes"]) {
+    const { rows } = await pool.query<PositioningRow>(
+      `select ${POSITIONING_COLS} from positioning_snapshots
+       where coin = $1 and ts <= to_timestamp($2 / 1000.0)
+         and ts >= to_timestamp($2 / 1000.0) - $3::interval
+       order by ts desc limit 1`,
+      [coin, targetMs, tolerance],
+    );
+    if (rows[0]) return rows[0];
+  }
+  return null;
 }
 
 export async function trackerCoverage(): Promise<{ tracked: number; pending: number; provisional: number }> {
