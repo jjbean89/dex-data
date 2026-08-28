@@ -19,6 +19,7 @@ import { log, logErr } from "../log.js";
 
 const SOURCE = "hypertracker";
 const HISTORY_SOURCE = "hypertracker-history";
+const DEEP_SOURCE = "hypertracker-deep";
 const REQUEST_TIMEOUT_MS = 120_000;
 const IMPORT_CHUNK = 10_000;
 const MAX_COIN_FAILURES = 10;
@@ -38,15 +39,16 @@ export function shouldSeed(): boolean {
   return config.hypertrackerApiKey !== "";
 }
 
-// True once every live coin has completed both the census and history imports.
+// True once every live coin has completed all enabled import passes.
 export async function seedComplete(): Promise<boolean> {
+  const sources = [SOURCE, HISTORY_SOURCE, ...(config.hypertrackerDeepHistory ? [DEEP_SOURCE] : [])];
   const { rows } = await pool.query<{ missing: number }>(
     `select count(*)::int as missing
      from perp_assets a
-     cross join (values ($1::text), ($2::text)) as src(source)
+     cross join unnest($1::text[]) as src(source)
      where a.is_delisted = false
        and not exists (select 1 from seed_progress s where s.source = src.source and s.coin = a.coin)`,
-    [SOURCE, HISTORY_SOURCE],
+    [sources],
   );
   return (rows[0]?.missing ?? 0) === 0;
 }
@@ -65,6 +67,7 @@ export async function runSeeder(isStopped: () => boolean): Promise<void> {
   try {
     await censusPass(isStopped);
     await historyPass(isStopped);
+    if (config.hypertrackerDeepHistory) await deepHistoryPass(isStopped);
   } catch (err) {
     if (err instanceof AuthError) {
       logErr("seed", "hypertracker API key rejected — aborting. Fix HYPERTRACKER_API_KEY and redeploy; imports resume automatically");
@@ -230,7 +233,7 @@ function findPresignedUrl(v: unknown): string | null {
 function extractJsonList(parsed: unknown): Array<Record<string, unknown>> {
   if (Array.isArray(parsed)) return parsed.filter(isRecord);
   if (isRecord(parsed)) {
-    for (const key of ["data", "positions", "results", "rows", "items"]) {
+    for (const key of ["data", "positions", "results", "rows", "items", "metrics"]) {
       const val = parsed[key];
       if (Array.isArray(val)) return val.filter(isRecord);
     }
@@ -288,6 +291,120 @@ interface HistRow {
   szShort: number | null;
   ntlLong: number | null;
   ntlShort: number | null;
+}
+
+// Deep archive: walk each coin backward through the paginated position-metrics
+// series (snapshots every ~15min back to HYPERTRACKER_DEEP_START). The resume
+// point is the database itself — each request asks for rows strictly older than
+// the oldest 'hypertracker' row we already hold — so quota walls interrupt
+// nothing and no cursor state is stored.
+async function deepHistoryPass(isStopped: () => boolean): Promise<void> {
+  const todo = await pendingCoins(DEEP_SOURCE);
+  if (todo.length === 0) {
+    log("seed", "hypertracker deep history already imported");
+    return;
+  }
+  log("seed", `hypertracker deep-history import starting: ${todo.length} coins (target ${config.hypertrackerDeepStart})`);
+
+  let failures = 0;
+  for (const coin of todo) {
+    if (isStopped()) return;
+    try {
+      const { imported, oldest, requests } = await deepImportCoin(coin, isStopped);
+      if (isStopped()) return; // interrupted mid-coin — resume next cycle, no progress marker
+      await pool.query(
+        `insert into seed_progress (source, coin, wallets, rows_imported) values ($1, $2, 0, $3)
+         on conflict (source, coin) do update set
+           completed_at = now(), rows_imported = excluded.rows_imported`,
+        [DEEP_SOURCE, coin, imported],
+      );
+      log("seed", `${coin}: deep history complete — ${imported} rows${oldest ? ` back to ${oldest.slice(0, 10)}` : ""} (${requests} requests)`);
+      await opsEvent("seed-deep", "info", `${coin}: complete, ${imported} rows${oldest ? ` back to ${oldest.slice(0, 10)}` : ""}`);
+    } catch (err) {
+      if (err instanceof AuthError || err instanceof QuotaError) throw err;
+      failures++;
+      logErr("seed", `${coin} deep history failed (${failures}/${MAX_COIN_FAILURES})`, err);
+      await opsEvent("seed-deep", "error", `${coin}: ${err instanceof Error ? err.message : String(err)}`);
+      if (failures >= MAX_COIN_FAILURES) {
+        logErr("seed", "too many deep-history failures — stopping; remaining coins retry later");
+        return;
+      }
+    }
+    await sleepFor(config.hypertrackerReqDelayMs, isStopped);
+  }
+  log("seed", "hypertracker deep-history import finished");
+  await opsEvent("seed-deep", "info", "deep-history import finished");
+}
+
+async function deepImportCoin(
+  coin: string,
+  isStopped: () => boolean,
+): Promise<{ imported: number; oldest: string | null; requests: number }> {
+  const deepStartMs = Date.parse(config.hypertrackerDeepStart);
+  if (!Number.isFinite(deepStartMs)) throw new Error(`invalid HYPERTRACKER_DEEP_START "${config.hypertrackerDeepStart}"`);
+  let imported = 0;
+  let requests = 0;
+  let oldest: string | null = null;
+  while (!isStopped()) {
+    const { rows } = await pool.query<{ min: Date | null }>(
+      "select min(ts) as min from positioning_snapshots where coin = $1 and source = 'hypertracker'",
+      [coin],
+    );
+    const endMs = rows[0]?.min ? rows[0].min.getTime() - 1_000 : Date.now();
+    if (endMs <= deepStartMs) break;
+    await sleepFor(config.hypertrackerReqDelayMs, isStopped);
+    if (isStopped()) break;
+    const page = await fetchMetricsPage(coin, new Date(deepStartMs).toISOString(), new Date(endMs).toISOString());
+    requests++;
+    if (page.length === 0) break; // nothing older — reached the start of their record
+    imported += await importHistory(coin, page);
+    const oldestInPage = page.reduce((m, r) => (r.ts < m ? r.ts : m), page[0]!.ts);
+    oldest = oldestInPage.toISOString();
+    if (oldestInPage.getTime() >= endMs + 1_000) {
+      // The API ignored our end bound — bail rather than loop forever.
+      throw new Error(`position-metrics ignored end filter (oldest returned ${oldest} >= requested end)`);
+    }
+  }
+  return { imported, oldest, requests };
+}
+
+// Paginated series rows are objects: {createdAt, positionCount, positionCountLong,
+// totalPositionValue(Long), totalPositionSize(Long), ...} — unlike the export's
+// column/data format, this one includes the size breakdown.
+async function fetchMetricsPage(coin: string, startIso: string, endIso: string): Promise<HistRow[]> {
+  const url =
+    `${config.hypertrackerBaseUrl}/external/position-metrics/coin/${encodeURIComponent(coin)}` +
+    `?limit=1000&start=${encodeURIComponent(startIso)}&end=${encodeURIComponent(endIso)}`;
+  const res = await httpGet(url, { Authorization: `Bearer ${config.hypertrackerApiKey}` });
+  const text = await res.text();
+  try {
+    const list = extractJsonList(JSON.parse(text));
+    const out: HistRow[] = [];
+    for (const raw of list) {
+      const tsMs = typeof raw.createdAt === "string" ? Date.parse(raw.createdAt) : NaN;
+      const count = toNum(raw.positionCount);
+      const nLong = toNum(raw.positionCountLong);
+      if (!Number.isFinite(tsMs) || count === null || nLong === null || nLong > count || nLong < 0) continue;
+      const val = toNum(raw.totalPositionValue);
+      const valLong = toNum(raw.totalPositionValueLong);
+      const sz = toNum(raw.totalPositionSize);
+      const szLong = toNum(raw.totalPositionSizeLong);
+      out.push({
+        ts: new Date(tsMs),
+        nLong: Math.round(nLong),
+        nShort: Math.round(count - nLong),
+        szLong,
+        szShort: sz !== null && szLong !== null ? sz - szLong : null,
+        ntlLong: valLong,
+        ntlShort: val !== null && valLong !== null ? val - valLong : null,
+      });
+    }
+    return out;
+  } catch (err) {
+    const snippet = text.slice(0, 200).replace(/\s+/g, " ");
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`${msg} — body starts: ${snippet}`);
+  }
 }
 
 // GET /external/exports/coins/{coin}/position-metrics → {coin, metrics: {columns, data}}.
@@ -509,6 +626,8 @@ async function httpGet(url: string, headers: Record<string, string>): Promise<Re
     try {
       const res = await fetch(url, { headers, signal: controller.signal });
       if (res.status === 401 || res.status === 403) throw new AuthError(`HTTP ${res.status}`);
+      // Their limiter signals a spent request quota with 402 Payment Required.
+      if (res.status === 402) throw new QuotaError("HTTP 402 (request quota spent)");
       if (res.status === 429) {
         sawRateLimit = true;
         // Their limiter returns retry_after (header or JSON body); a short value is a

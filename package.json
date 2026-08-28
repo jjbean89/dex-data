@@ -1,6 +1,6 @@
 {
   "name": "dex-data",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Custom Hyperliquid market data service: records open interest, funding, and prices, and serves derived data (1h changes, OI/funding history, venue-wide aggregates) over a REST API.",
   "type": "module",
