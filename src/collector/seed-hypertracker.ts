@@ -509,6 +509,8 @@ async function httpGet(url: string, headers: Record<string, string>): Promise<Re
     try {
       const res = await fetch(url, { headers, signal: controller.signal });
       if (res.status === 401 || res.status === 403) throw new AuthError(`HTTP ${res.status}`);
+      // Their limiter signals a spent request quota with 402 Payment Required.
+      if (res.status === 402) throw new QuotaError("HTTP 402 (request quota spent)");
       if (res.status === 429) {
         sawRateLimit = true;
         // Their limiter returns retry_after (header or JSON body); a short value is a
