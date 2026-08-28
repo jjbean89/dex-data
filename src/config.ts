@@ -1,3 +1,5 @@
+import { log } from "./log.js";
+
 function numEnv(name: string, def: number): number {
   const raw = process.env[name];
   if (raw === undefined || raw === "") return def;
@@ -26,7 +28,7 @@ export const config = {
   // Long/short trader tracking (trades WebSocket + per-wallet position ledger).
   positionsEnabled: process.env.POSITIONS_ENABLED !== "false",
   hlWsUrl: process.env.HL_WS_URL ?? "wss://api.hyperliquid.xyz/ws",
-  positionsFlushMs: numEnv("POSITIONS_FLUSH_MS", 1_000),
+  positionsFlushMs: numEnv("POSITIONS_FLUSH_MS", 5_000),
   bootstrapDelayMs: numEnv("BOOTSTRAP_DELAY_MS", 400),
   positionsSnapshotMs: numEnv("POSITIONS_SNAPSHOT_MS", 300_000),
   reverifyIntervalMs: numEnv("REVERIFY_INTERVAL_MS", 21_600_000),
@@ -52,5 +54,19 @@ export function assertConfig(): void {
   }
   if (config.pollIntervalMs < 2_000) {
     throw new Error("POLL_INTERVAL_MS below 2000ms would burn the Hyperliquid rate-limit budget");
+  }
+  // Railway bills every byte through the public TCP proxy as egress; the collector
+  // talks to Postgres constantly, so that misconfiguration quietly gets expensive.
+  try {
+    const host = new URL(config.databaseUrl).hostname;
+    if (/\.rlwy\.net$|\.railway\.app$/i.test(host)) {
+      log(
+        "config",
+        `WARNING: DATABASE_URL host "${host}" is Railway's public proxy — all DB traffic is billed as egress. ` +
+          "Use the private-network reference (${{Postgres.DATABASE_URL}} → postgres.railway.internal) instead.",
+      );
+    }
+  } catch {
+    // non-URL conninfo strings are fine
   }
 }

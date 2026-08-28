@@ -51,7 +51,7 @@ One repo, three Railway services:
    - `ROLE` = `api`
    - Generate a public domain. Set the healthcheck path to `/health`. Railway injects `PORT` automatically.
 
-Use the **private-network** `DATABASE_URL` reference (`${{Postgres.DATABASE_URL}}`) so traffic stays internal; if you ever connect through Railway's public proxy instead, set `PG_SSL_NO_VERIFY=true`.
+Use the **private-network** `DATABASE_URL` reference (`${{Postgres.DATABASE_URL}}`) so traffic stays internal — Railway bills public-proxy traffic as egress, and the collector talks to Postgres constantly, so the wrong URL turns into a real line item. The service logs a loud warning at boot if it sees a public-proxy host. If you must go through the proxy anyway, set `PG_SSL_NO_VERIFY=true`.
 
 Deploys are zero-drama: the collector shuts down gracefully on SIGTERM and the DB persists, so a redeploy costs seconds of ticks. Both services run migrations at boot behind an advisory lock, so start order doesn't matter. (`ROLE=all` runs both in one service if you want to start smaller.)
 
@@ -74,14 +74,14 @@ Deploys are zero-drama: the collector shuts down gracefully on SIGTERM and the D
 | `HL_WS_URL` | `wss://api.hyperliquid.xyz/ws` | Trades feed |
 | `POSITIONS_SNAPSHOT_MS` | `300000` | Long/short snapshot cadence (resolution of the history series) |
 | `BOOTSTRAP_DELAY_MS` | `400` | Pacing between clearinghouseState wallet lookups |
-| `POSITIONS_FLUSH_MS` / `REVERIFY_INTERVAL_MS` / `REVERIFY_BATCH` | `1000` / `6h` / `2000` | Fill-delta write cadence; self-heal sweep |
+| `POSITIONS_FLUSH_MS` / `REVERIFY_INTERVAL_MS` / `REVERIFY_BATCH` | `5000` / `6h` / `2000` | Fill-delta write cadence; self-heal sweep |
 | `HYPERTRACKER_API_KEY` | — | Enables the one-time starting-census import (see positioning docs below) |
 | `HYPERTRACKER_BASE_URL` / `HYPERTRACKER_REQ_DELAY_MS` | `https://ht-api.coinmarketman.com/api` / `1500` | Census source + pacing |
 | `PG_SSL_NO_VERIFY` | `false` | Accept self-signed Postgres TLS (Railway public proxy) |
 
 ## API
 
-All responses are JSON, CORS `*`, UTC timestamps (ISO + `tMs` epoch millis on series). Errors: `{"error":{"code","message"}}` with 400/404/503. Funding rates are **hourly decimals** (`0.0000125` = 0.00125%/hr ≈ 10.95% APR — `aprPct` fields do the conversion). OI is reported in coins (`openInterest`) and USD (`oiUsd` = OI × mark price).
+All responses are JSON (gzip-compressed when the client sends `Accept-Encoding: gzip`), CORS `*`, UTC timestamps (ISO + `tMs` epoch millis on series). Errors: `{"error":{"code","message"}}` with 400/404/503. Funding rates are **hourly decimals** (`0.0000125` = 0.00125%/hr ≈ 10.95% APR — `aprPct` fields do the conversion). OI is reported in coins (`openInterest`) and USD (`oiUsd` = OI × mark price).
 
 ### `GET /v1/perps/changes?window=1h`
 The headline endpoint: price, OI, and funding change over any window for every coin, sorted. Params: `window` (`5m`…`14d`, rolling, default `1h`), `sort` (`px|oi|funding|volume`), `dir`, `limit`, `minOiUsd` (filter dust).
@@ -148,6 +148,7 @@ Honest semantics — read this before charting it:
 - **Retention:** raw ticks 14d → 5m candles 180d → 1h candles forever. `/changes` windows are bounded by raw retention; longer lookbacks come from the candle endpoints.
 - **Scale:** ~176 live coins × 4 ticks/min ≈ 1M rows/day raw, pruned at 14d ≈ 14M rows steady-state — comfortable for stock Postgres. If you later want years of raw ticks, TimescaleDB is a drop-in upgrade (deploy the `timescale/timescaledb` image as a Railway service instead of managed Postgres).
 - **Redundancy:** OI can't be backfilled, so if this becomes commercial, run a second collector against a second DB (different egress IP) as insurance.
+- **Cost levers**, in descending order of impact, if the Railway bill needs trimming: keep `DATABASE_URL` on the private network (see above); `POSITIONS_ENABLED=false` drops the WebSocket firehose, the wallet bootstrapper, and the two largest tables entirely; `POLL_INTERVAL_MS=30000` halves raw-tick volume and write load with candles still built from 10 ticks per 5m bucket; `REVERIFY_BATCH` scales the background clearinghouseState traffic; `RAW_RETENTION_DAYS` bounds the biggest table. Everything already in place — watermarked rollups, batched writes, response compression, capped retention — needs no tuning.
 
 ## Roadmap
 

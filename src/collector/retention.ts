@@ -3,7 +3,7 @@ import { pool } from "../db/pool.js";
 
 // Raw ticks and 5m candles are bounded; 1h candles (per-coin and venue-wide) are the
 // permanent record and are never pruned.
-export async function pruneOldData(): Promise<{ ticks: number; candles5m: number }> {
+export async function pruneOldData(): Promise<{ ticks: number; candles5m: number; flatPositions: number }> {
   const t = await pool.query("delete from perp_ticks where ts < now() - make_interval(days => $1)", [
     config.rawRetentionDays,
   ]);
@@ -14,5 +14,14 @@ export async function pruneOldData(): Promise<{ ticks: number; candles5m: number
     config.candles5mRetentionDays,
   ]);
   await pool.query("delete from ops_events where ts < now() - interval '14 days'");
-  return { ticks: t.rowCount ?? 0, candles5m: (c1.rowCount ?? 0) + (c2.rowCount ?? 0) };
+  // Fully closed positions are dead weight: snapshots filter szi <> 0, and a later
+  // fill simply re-inserts the row. Keep the ledger to open positions only.
+  const p = await pool.query(
+    "delete from positions where szi = 0 and updated_at < now() - interval '1 hour'",
+  );
+  return {
+    ticks: t.rowCount ?? 0,
+    candles5m: (c1.rowCount ?? 0) + (c2.rowCount ?? 0),
+    flatPositions: p.rowCount ?? 0,
+  };
 }

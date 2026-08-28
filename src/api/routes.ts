@@ -219,18 +219,22 @@ export function registerRoutes(app: FastifyInstance): void {
 
   app.get("/health", async (_req, reply) => {
     try {
-      const { rows } = await pool.query<{ last: Date | null; coins: number }>(
-        `select max(ts) as last, count(distinct coin)::int as coins
-         from perp_ticks where ts >= now() - interval '10 minutes'`,
-      );
-      const last = rows[0]?.last ?? null;
+      // Cached briefly so uptime monitors hammering /health don't each scan ticks;
+      // the age math runs per request, so staleness detection stays live.
+      const { last, coins } = await cached("health:ticks", CACHE_MS, async () => {
+        const { rows } = await pool.query<{ last: Date | null; coins: number }>(
+          `select max(ts) as last, count(distinct coin)::int as coins
+           from perp_ticks where ts >= now() - interval '10 minutes'`,
+        );
+        return { last: rows[0]?.last ?? null, coins: rows[0]?.coins ?? 0 };
+      });
       const tickAgeSec = last ? Math.round((Date.now() - last.getTime()) / 1000) : null;
       return {
         ok: true,
         lastTickAt: last ? last.toISOString() : null,
         tickAgeSec,
         ticksStale: tickAgeSec === null || tickAgeSec > 120,
-        liveCoins: rows[0]?.coins ?? 0,
+        liveCoins: coins,
       };
     } catch {
       return reply.code(500).send({ ok: false, error: { code: "db_unreachable", message: "database query failed" } });
