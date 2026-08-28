@@ -321,9 +321,17 @@ export interface PositioningRow {
   ntl_short: number | null;
   traders_tracked: number | null;
   source: string; // 'live' (our ledger) or 'hypertracker' (backfilled history)
+  avg_entry_long: number | null;
+  avg_entry_short: number | null;
+  n_long_entry: number | null;
+  n_short_entry: number | null;
+  n_long_profit: number | null;
+  n_short_profit: number | null;
 }
 
-const POSITIONING_COLS = "ts, coin, n_long, n_short, sz_long, sz_short, ntl_long, ntl_short, traders_tracked, source";
+const POSITIONING_COLS = `ts, coin, n_long, n_short, sz_long, sz_short, ntl_long, ntl_short,
+  traders_tracked, source, avg_entry_long, avg_entry_short,
+  n_long_entry, n_short_entry, n_long_profit, n_short_profit`;
 
 export async function latestPositioning(): Promise<PositioningRow[]> {
   const { rows } = await pool.query<PositioningRow>(

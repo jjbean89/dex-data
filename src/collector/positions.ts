@@ -185,7 +185,8 @@ export function startPositionsTracker(isStopped: () => boolean): () => Promise<v
          order by coin, ts desc
        )
        insert into positioning_snapshots
-         (ts, coin, n_long, n_short, sz_long, sz_short, ntl_long, ntl_short, traders_tracked)
+         (ts, coin, n_long, n_short, sz_long, sz_short, ntl_long, ntl_short, traders_tracked,
+          avg_entry_long, avg_entry_short, n_long_entry, n_short_entry, n_long_profit, n_short_profit)
        select
          to_timestamp(floor(extract(epoch from now()) / $1) * $1),
          p.coin,
@@ -195,7 +196,15 @@ export function startPositionsTracker(isStopped: () => boolean): () => Promise<v
          coalesce(-sum(p.szi) filter (where p.szi < 0), 0),
          sum(p.szi * m.mark_px) filter (where p.szi > 0),
          -sum(p.szi * m.mark_px) filter (where p.szi < 0),
-         (select count(*) from traders where not bootstrap_pending)::int
+         (select count(*) from traders where not bootstrap_pending)::int,
+         sum(p.szi * p.entry_px) filter (where p.szi > 0 and p.entry_px is not null)
+           / nullif(sum(p.szi) filter (where p.szi > 0 and p.entry_px is not null), 0),
+         sum(-p.szi * p.entry_px) filter (where p.szi < 0 and p.entry_px is not null)
+           / nullif(sum(-p.szi) filter (where p.szi < 0 and p.entry_px is not null), 0),
+         (count(*) filter (where p.szi > 0 and p.entry_px is not null and m.mark_px is not null))::int,
+         (count(*) filter (where p.szi < 0 and p.entry_px is not null and m.mark_px is not null))::int,
+         (count(*) filter (where p.szi > 0 and p.entry_px is not null and m.mark_px > p.entry_px))::int,
+         (count(*) filter (where p.szi < 0 and p.entry_px is not null and m.mark_px < p.entry_px))::int
        from positions p
        left join marks m on m.coin = p.coin
        where p.szi <> 0
@@ -204,7 +213,10 @@ export function startPositionsTracker(isStopped: () => boolean): () => Promise<v
          n_long = excluded.n_long, n_short = excluded.n_short,
          sz_long = excluded.sz_long, sz_short = excluded.sz_short,
          ntl_long = excluded.ntl_long, ntl_short = excluded.ntl_short,
-         traders_tracked = excluded.traders_tracked`,
+         traders_tracked = excluded.traders_tracked,
+         avg_entry_long = excluded.avg_entry_long, avg_entry_short = excluded.avg_entry_short,
+         n_long_entry = excluded.n_long_entry, n_short_entry = excluded.n_short_entry,
+         n_long_profit = excluded.n_long_profit, n_short_profit = excluded.n_short_profit`,
       [intervalSec],
     );
   }

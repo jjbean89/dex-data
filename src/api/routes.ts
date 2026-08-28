@@ -132,6 +132,27 @@ function serializePositioning(r: PositioningRow, includeCoin: boolean): Record<s
     netNtlUsd: ntlLong !== null && ntlShort !== null ? ntlLong - ntlShort : null,
     tradersTracked: r.traders_tracked,
     source: r.source,
+    entries: serializeEntries(r),
+  };
+}
+
+// Entry-price analytics (size-weighted avg entry per side; in-profit vs underwater
+// counts among positions with a known entry price). Null on pre-migration and
+// backfilled rows.
+function serializeEntries(r: PositioningRow): Record<string, unknown> | null {
+  if (r.n_long_entry === null || r.n_short_entry === null) return null;
+  const longProfit = r.n_long_profit ?? 0;
+  const shortProfit = r.n_short_profit ?? 0;
+  return {
+    avgEntryLong: r.avg_entry_long,
+    avgEntryShort: r.avg_entry_short,
+    longsInProfit: longProfit,
+    longsUnderwater: r.n_long_entry - longProfit,
+    shortsInProfit: shortProfit,
+    shortsUnderwater: r.n_short_entry - shortProfit,
+    pctLongsInProfit: r.n_long_entry > 0 ? (longProfit / r.n_long_entry) * 100 : null,
+    pctShortsInProfit: r.n_short_entry > 0 ? (shortProfit / r.n_short_entry) * 100 : null,
+    withKnownEntry: { long: r.n_long_entry, short: r.n_short_entry },
   };
 }
 
