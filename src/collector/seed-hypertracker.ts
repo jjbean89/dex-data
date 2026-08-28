@@ -75,12 +75,17 @@ export async function runSeeder(isStopped: () => boolean): Promise<void> {
   }
 }
 
+// Pending coins ordered by open interest, so the markets that matter import inside
+// the first available quota window rather than after the alphabetical long tail.
 async function pendingCoins(source: string): Promise<string[]> {
   const { rows } = await pool.query<{ coin: string }>(
     `select a.coin from perp_assets a
+     left join lateral (
+       select oi_usd from perp_ticks t where t.coin = a.coin order by ts desc limit 1
+     ) l on true
      where a.is_delisted = false
        and not exists (select 1 from seed_progress s where s.source = $1 and s.coin = a.coin)
-     order by a.coin`,
+     order by l.oi_usd desc nulls last, a.coin`,
     [source],
   );
   return rows.map((r) => r.coin);
@@ -284,14 +289,23 @@ interface HistRow {
 async function fetchMetricsHistory(coin: string): Promise<HistRow[]> {
   const url = `${config.hypertrackerBaseUrl}/external/exports/coins/${encodeURIComponent(coin)}/position-metrics`;
   const res = await httpGet(url, { Authorization: `Bearer ${config.hypertrackerApiKey}` });
-  const parsed: unknown = JSON.parse(await res.text());
-  const presigned = findPresignedUrl(parsed);
-  if (presigned) {
-    const fileRes = await httpGet(presigned, {});
-    if (!fileRes.ok) throw new Error(`presigned fetch: HTTP ${fileRes.status}`);
-    return parseMetricsExport(JSON.parse(await fileRes.text()));
+  let text = await res.text();
+  try {
+    let parsed: unknown = JSON.parse(text);
+    const presigned = findPresignedUrl(parsed);
+    if (presigned) {
+      const fileRes = await httpGet(presigned, {});
+      if (!fileRes.ok) throw new Error(`presigned fetch: HTTP ${fileRes.status}`);
+      text = await fileRes.text();
+      parsed = JSON.parse(text);
+    }
+    return parseMetricsExport(parsed);
+  } catch (err) {
+    // Surface what actually came back so a single log line diagnoses format drift.
+    const snippet = text.slice(0, 200).replace(/\s+/g, " ");
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`${msg} — body starts: ${snippet}`);
   }
-  return parseMetricsExport(parsed);
 }
 
 function parseMetricsExport(body: unknown): HistRow[] {
