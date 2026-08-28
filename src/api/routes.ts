@@ -168,6 +168,34 @@ export function registerRoutes(app: FastifyInstance): void {
     ],
   }));
 
+  // Seed pipeline diagnostics: import progress plus the collector's recent
+  // operational events, so failures are debuggable without host log access.
+  app.get("/v1/ops/seed", async () => {
+    const [progress, events] = await Promise.all([
+      pool.query<{ source: string; done: number }>(
+        "select source, count(*)::int as done from seed_progress group by source",
+      ),
+      pool.query<{ ts: Date; tag: string; level: string; message: string }>(
+        "select ts, tag, level, message from ops_events order by ts desc limit 50",
+      ),
+    ]);
+    const { rows: totalRows } = await pool.query<{ n: number }>(
+      "select count(*)::int as n from perp_assets where is_delisted = false",
+    );
+    const total = totalRows[0]?.n ?? 0;
+    const doneBy = new Map(progress.rows.map((r) => [r.source, r.done]));
+    return {
+      census: { done: doneBy.get("hypertracker") ?? 0, total },
+      history: { done: doneBy.get("hypertracker-history") ?? 0, total },
+      recentEvents: events.rows.map((e) => ({
+        t: e.ts.toISOString(),
+        tag: e.tag,
+        level: e.level,
+        message: e.message,
+      })),
+    };
+  });
+
   app.get("/health", async (_req, reply) => {
     try {
       const { rows } = await pool.query<{ last: Date | null; coins: number }>(

@@ -1,4 +1,5 @@
 import { config } from "../config.js";
+import { opsEvent } from "../db/ops.js";
 import { pool } from "../db/pool.js";
 import { sleep } from "../hl/client.js";
 import { log, logErr } from "../log.js";
@@ -67,8 +68,10 @@ export async function runSeeder(isStopped: () => boolean): Promise<void> {
   } catch (err) {
     if (err instanceof AuthError) {
       logErr("seed", "hypertracker API key rejected — aborting. Fix HYPERTRACKER_API_KEY and redeploy; imports resume automatically");
+      await opsEvent("seed", "error", `API key rejected (${err.message}) — imports paused until key fixed`);
     } else if (err instanceof QuotaError) {
-      log("seed", "hypertracker request quota exhausted — pausing. Imports resume on the next boot (the free tier's 100 req/day quota resets daily; a paid tier finishes in one pass)");
+      log("seed", "hypertracker request quota exhausted — pausing. Imports resume at the next retry (free tier resets daily; a paid tier finishes in one pass)");
+      await opsEvent("seed", "warn", `quota exhausted (${err.message}) — retrying in ${Math.round(config.hypertrackerRetryMs / 3_600_000)}h`);
     } else {
       throw err;
     }
@@ -121,14 +124,16 @@ async function censusPass(isStopped: () => boolean): Promise<void> {
       if (err instanceof AuthError || err instanceof QuotaError) throw err;
       failures++;
       logErr("seed", `${coin} failed (${failures}/${MAX_COIN_FAILURES})`, err);
+      await opsEvent("seed-census", "error", `${coin}: ${err instanceof Error ? err.message : String(err)}`);
       if (failures >= MAX_COIN_FAILURES) {
-        logErr("seed", "too many census failures — stopping; remaining coins retry on next boot");
+        logErr("seed", "too many census failures — stopping; remaining coins retry later");
         return;
       }
     }
     await sleepFor(config.hypertrackerReqDelayMs, isStopped);
   }
   log("seed", "hypertracker census import finished");
+  await opsEvent("seed-census", "info", "census import finished");
 }
 
 // Import HyperTracker's 2h-sampled long/short count history into
@@ -160,14 +165,16 @@ async function historyPass(isStopped: () => boolean): Promise<void> {
       if (err instanceof AuthError || err instanceof QuotaError) throw err;
       failures++;
       logErr("seed", `${coin} history failed (${failures}/${MAX_COIN_FAILURES})`, err);
+      await opsEvent("seed-history", "error", `${coin}: ${err instanceof Error ? err.message : String(err)}`);
       if (failures >= MAX_COIN_FAILURES) {
-        logErr("seed", "too many history failures — stopping; remaining coins retry on next boot");
+        logErr("seed", "too many history failures — stopping; remaining coins retry later");
         return;
       }
     }
     await sleepFor(config.hypertrackerReqDelayMs, isStopped);
   }
   log("seed", "hypertracker count-history import finished");
+  await opsEvent("seed-history", "info", "count-history import finished");
 }
 
 async function fetchOpenPositions(coin: string): Promise<{ rows: SeedRow[]; sampleFields: string | null }> {

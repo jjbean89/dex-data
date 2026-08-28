@@ -13,5 +13,6 @@ export async function pruneOldData(): Promise<{ ticks: number; candles5m: number
   const c2 = await pool.query("delete from market_candles_5m where t < now() - make_interval(days => $1)", [
     config.candles5mRetentionDays,
   ]);
+  await pool.query("delete from ops_events where ts < now() - interval '14 days'");
   return { ticks: t.rowCount ?? 0, candles5m: (c1.rowCount ?? 0) + (c2.rowCount ?? 0) };
 }
