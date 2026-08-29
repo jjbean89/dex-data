@@ -405,6 +405,34 @@ export function trackerCoverage(): Promise<{ tracked: number; pending: number; p
   });
 }
 
+export interface EmaStateApiRow {
+  coin: string;
+  tf: string;
+  period: number;
+  ema: number | null; // null while a young listing accumulates its first `period` closes
+  n_candles: number;
+  last_open_ms: string; // bigint arrives as a string
+  updated_at: Date;
+}
+
+const EMA_COLS = "s.coin, s.tf, s.period, s.ema, s.n_candles, s.last_open_ms, s.updated_at";
+
+// Latest EMA per (coin, timeframe, period) for every live coin — the whole
+// table is ~coins × timeframes × periods rows, so one scan serves the screener.
+export async function emaStates(): Promise<EmaStateApiRow[]> {
+  const { rows } = await pool.query<EmaStateApiRow>(
+    `select ${EMA_COLS} from ema_state s
+     join perp_assets a on a.coin = s.coin
+     where a.is_delisted = false`,
+  );
+  return rows;
+}
+
+export async function emaStatesFor(coin: string): Promise<EmaStateApiRow[]> {
+  const { rows } = await pool.query<EmaStateApiRow>(`select ${EMA_COLS} from ema_state s where s.coin = $1`, [coin]);
+  return rows;
+}
+
 // Venue OI (close) at or just before the target time, for market snapshot change math.
 export async function marketOiCloseAt(targetMs: number): Promise<number | null> {
   const { rows } = await pool.query<{ oi_usd_c: number | null }>(

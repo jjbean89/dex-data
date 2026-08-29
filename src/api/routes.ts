@@ -1,8 +1,11 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
-import { config } from "../config.js";
+import { EMA_TF_MS, config } from "../config.js";
 import { pool } from "../db/pool.js";
 import {
+  LATEST_MAX_AGE_MS,
   changesBundle,
+  emaStates,
+  emaStatesFor,
   fundingRows,
   latestPositioning,
   latestPositioningFor,
@@ -20,9 +23,11 @@ import {
   type CandleInterval,
   type ChangeRow,
   type ChangesBundle,
+  type EmaStateApiRow,
   type MarketCandleRow,
   type PerpCandleRow,
   type PositioningRow,
+  type TickRow,
 } from "./queries.js";
 import { aprPct, cached, parseLimit, parseTimeMs, parseWindow, pctChange, rollingMean } from "./util.js";
 
@@ -156,6 +161,115 @@ function serializeEntries(r: PositioningRow): Record<string, unknown> | null {
   };
 }
 
+interface EmaCoinEntry {
+  coin: string;
+  asOf: string | null;
+  px: number | null;
+  oiUsd: number | null;
+  tfs: Record<string, unknown>;
+}
+
+const tfAsc = (a: string, b: string): number => (EMA_TF_MS[a] ?? Infinity) - (EMA_TF_MS[b] ?? Infinity);
+
+// One coin's EMA block: per timeframe, the raw EMAs plus the screener columns —
+// price distance from each EMA and the fastest-vs-slowest spread (the "cross"
+// column: positive = fast EMA above slow, a sign flip = golden/death cross).
+function buildEmaEntry(coin: string, tick: TickRow | null, rows: EmaStateApiRow[]): EmaCoinEntry {
+  const px = tick?.px ?? null;
+  const byTf = new Map<string, EmaStateApiRow[]>();
+  for (const r of rows) {
+    const list = byTf.get(r.tf) ?? [];
+    list.push(r);
+    byTf.set(r.tf, list);
+  }
+  const tfs: Record<string, unknown> = {};
+  for (const tf of [...byTf.keys()].sort(tfAsc)) {
+    const tfRows = byTf.get(tf)!.sort((a, b) => a.period - b.period);
+    const ema: Record<string, number | null> = {};
+    const pxVsEmaPct: Record<string, number | null> = {};
+    let nCandles = 0;
+    for (const r of tfRows) {
+      ema[String(r.period)] = r.ema;
+      pxVsEmaPct[String(r.period)] = pctChange(px, r.ema);
+      nCandles = Math.max(nCandles, r.n_candles);
+    }
+    const fast = tfRows[0]!;
+    const slow = tfRows[tfRows.length - 1]!;
+    const lastOpenMs = Number(tfRows[0]!.last_open_ms);
+    tfs[tf] = {
+      t: new Date(lastOpenMs).toISOString(), // open of the last closed candle applied
+      tMs: lastOpenMs,
+      nCandles,
+      ema,
+      pxVsEmaPct,
+      spreadPct: tfRows.length > 1 ? pctChange(fast.ema, slow.ema) : null,
+    };
+  }
+  return { coin, asOf: tick ? tick.ts.toISOString() : null, px, oiUsd: tick?.oi_usd ?? null, tfs };
+}
+
+interface EmaBase {
+  asOf: string | null;
+  periods: number[];
+  timeframes: string[];
+  entries: EmaCoinEntry[];
+}
+
+// Assembled once per cache window: every live coin's EMA block joined with its
+// latest price, sorted by open interest like the universe list.
+async function emaBase(): Promise<EmaBase> {
+  const [rows, ticks] = await Promise.all([emaStates(), latestTicks()]);
+  const tickBy = new Map(ticks.map((t) => [t.coin, t]));
+  const byCoin = new Map<string, EmaStateApiRow[]>();
+  const periods = new Set<number>();
+  const timeframes = new Set<string>();
+  for (const r of rows) {
+    const list = byCoin.get(r.coin) ?? [];
+    list.push(r);
+    byCoin.set(r.coin, list);
+    periods.add(r.period);
+    timeframes.add(r.tf);
+  }
+  const entries = [...byCoin.entries()].map(([coin, coinRows]) => buildEmaEntry(coin, tickBy.get(coin) ?? null, coinRows));
+  entries.sort((a, b) => {
+    if (a.oiUsd === null && b.oiUsd === null) return a.coin.localeCompare(b.coin);
+    if (a.oiUsd === null) return 1;
+    if (b.oiUsd === null) return -1;
+    return b.oiUsd - a.oiUsd || a.coin.localeCompare(b.coin);
+  });
+  let asOf: string | null = null;
+  for (const t of ticks) if (!asOf || t.ts.toISOString() > asOf) asOf = t.ts.toISOString();
+  return {
+    asOf,
+    periods: [...periods].sort((a, b) => a - b),
+    timeframes: [...timeframes].sort(tfAsc),
+    entries,
+  };
+}
+
+// Comma-separated list param: [] = absent (no filter), null = present but
+// invalid. Repeated params (?tf=1h&tf=4h) arrive as arrays — treat them as a list.
+function csvParam(v: unknown): string[] | null {
+  const s = Array.isArray(v) ? v.join(",") : typeof v === "string" ? v : v === undefined ? "" : null;
+  if (s === null) return null;
+  if (s === "") return [];
+  const names = s
+    .split(",")
+    .map((x) => x.trim())
+    .filter((x) => x !== "");
+  return names.length > 0 ? names : null;
+}
+
+function emasWarmingUp(reply: FastifyReply): FastifyReply {
+  return reply.code(503).send({
+    error: {
+      code: "no_ema_data",
+      message:
+        "no EMA state yet — the collector seeds it from Hyperliquid's candle history shortly after first boot (check EMAS_ENABLED and collector logs)",
+    },
+  });
+}
+
 function serializeMarketCandle(r: MarketCandleRow): Record<string, unknown> {
   return {
     t: r.t.toISOString(),
@@ -177,7 +291,9 @@ export function registerRoutes(app: FastifyInstance): void {
       "GET /health",
       "GET /v1/perps",
       "GET /v1/perps/changes?window=1h&sort=px|oi|funding|volume&dir=desc&limit=50&minOiUsd=0",
+      "GET /v1/perps/emas?tf=1h,4h,12h,1d&coins=&minOiUsd=0&limit=500",
       "GET /v1/perps/:coin",
+      "GET /v1/perps/:coin/emas",
       "GET /v1/perps/:coin/candles?interval=5m|1h|1d&from=&to=&limit=300",
       "GET /v1/perps/:coin/funding-history?from=&to=&limit=168",
       "GET /v1/perps/positioning?sort=traders|pctLong&dir=desc&limit=250",
@@ -311,6 +427,70 @@ export function registerRoutes(app: FastifyInstance): void {
       toleranceSec: Math.round(toleranceFor(windowMs) / 1000),
       count: data.length,
       data,
+    };
+  });
+
+  // The whole EMA board in one payload: every live coin × timeframe × period,
+  // with the screener columns precomputed against the latest price.
+  app.get("/v1/perps/emas", async (req, reply) => {
+    const q = req.query as Query;
+    const tfNames = csvParam(q.tf);
+    if (tfNames === null) return bad(reply, "invalid tf — use a comma-separated list like tf=1h,4h");
+    let tfFilter: Set<string> | null = null;
+    if (tfNames.length > 0) {
+      for (const name of tfNames) {
+        if (!(name in EMA_TF_MS)) return bad(reply, `invalid tf "${name}" — use any of ${Object.keys(EMA_TF_MS).join(", ")}`);
+      }
+      tfFilter = new Set(tfNames);
+    }
+    const coinNames = csvParam(q.coins);
+    if (coinNames === null) return bad(reply, "invalid coins — use a comma-separated list like coins=BTC,ETH");
+    let coinFilter: Set<string> | null = null;
+    if (coinNames.length > 0) {
+      coinFilter = new Set<string>();
+      for (const raw of coinNames) {
+        const asset = await resolveCoin(raw);
+        if (!asset) return notFound(reply, `no perp named "${raw}"`);
+        coinFilter.add(asset.coin);
+      }
+    }
+    const limit = parseLimit(q.limit, 500, 500);
+    if (limit === null) return bad(reply, "invalid limit");
+    const minOiUsd = q.minOiUsd !== undefined && q.minOiUsd !== "" ? Number(q.minOiUsd) : 0;
+    if (!Number.isFinite(minOiUsd)) return bad(reply, "invalid minOiUsd");
+
+    const base = await cached("emas:all", CACHE_MS, emaBase);
+    if (base.entries.length === 0) return emasWarmingUp(reply);
+    const data = base.entries
+      .filter((e) => (coinFilter ? coinFilter.has(e.coin) : true))
+      .filter((e) => (e.oiUsd ?? 0) >= minOiUsd)
+      .slice(0, limit)
+      .map((e) =>
+        tfFilter
+          ? { ...e, tfs: Object.fromEntries(Object.entries(e.tfs).filter(([tf]) => tfFilter.has(tf))) }
+          : e,
+      );
+    return {
+      asOf: base.asOf,
+      periods: base.periods,
+      timeframes: tfFilter ? base.timeframes.filter((tf) => tfFilter.has(tf)) : base.timeframes,
+      count: data.length,
+      data,
+    };
+  });
+
+  app.get("/v1/perps/:coin/emas", async (req, reply) => {
+    const { coin: coinRaw } = req.params as { coin: string };
+    const asset = await resolveCoin(coinRaw);
+    if (!asset) return notFound(reply, `no perp named "${coinRaw}"`);
+    const [rows, tickRaw] = await Promise.all([emaStatesFor(asset.coin), singleTick(asset.coin)]);
+    if (rows.length === 0) return emasWarmingUp(reply);
+    // Same staleness contract as the board endpoint: px is live or null, never stale.
+    const tick = tickRaw && Date.now() - tickRaw.ts.getTime() <= LATEST_MAX_AGE_MS ? tickRaw : null;
+    return {
+      ...buildEmaEntry(asset.coin, tick, rows),
+      periods: [...new Set(rows.map((r) => r.period))].sort((a, b) => a - b),
+      timeframes: [...new Set(rows.map((r) => r.tf))].sort(tfAsc),
     };
   });
 

@@ -7,6 +7,7 @@ Custom Hyperliquid market data service. Hyperliquid's public API only exposes th
 - **Funding history** — settled hourly rates (synced from HL back to whatever backfill depth you choose) plus recorded live rates
 - **Venue-wide aggregates** — total OI candles and OI-weighted average funding, the "Aggregated Open Interest" / "Aggregated Funding Rate" style series
 - **Long/short trader counts** — how many wallets are long vs. short each coin, with change over time (derived from the public trade tape + per-wallet position tracking; this exists in no API anywhere)
+- **EMAs for every coin on every timeframe** — EMA 21/200 on 1h/4h/12h/1d (all configurable), seeded from full candle history to match TradingView, plus the screener columns derived from them (price-vs-EMA %, EMA-vs-EMA cross spread) in one response
 
 One process polls `metaAndAssetCtxs` (every live perp in a single request) every 15s, rolls ticks up into 5m/1h candles, prunes raw data on a retention schedule, and runs the trades-WebSocket position tracker. A second process serves a read-only JSON API.
 
@@ -70,6 +71,11 @@ Deploys are zero-drama: the collector shuts down gracefully on SIGTERM and the D
 | `ROLLUP_INTERVAL_MS` | `60000` | Candle rollup cadence |
 | `RAW_RETENTION_DAYS` | `14` | Raw tick retention — also the max `window` on `/changes` |
 | `CANDLES_5M_RETENTION_DAYS` | `180` | 5m candle retention (1h candles are kept forever) |
+| `EMAS_ENABLED` | `true` | EMA tracker (see `/v1/perps/emas`) |
+| `EMA_TIMEFRAMES` | `1h,4h,12h,1d` | Timeframes to maintain — any of `1h,2h,4h,8h,12h,1d` |
+| `EMA_PERIODS` | `21,200` | EMA lengths per timeframe |
+| `EMA_REQ_DELAY_MS` | `2000` | Pacing between candleSnapshot requests (steady state ≈ 1 request/coin/hour) |
+| `EMA_RESEED_DAYS` | `7` | Re-seed each coin from full history every N days (self-heal; `0` disables) |
 | `POSITIONS_ENABLED` | `true` | Long/short trader tracking (trades WebSocket + position ledger) |
 | `HL_WS_URL` | `wss://api.hyperliquid.xyz/ws` | Trades feed |
 | `POSITIONS_SNAPSHOT_MS` | `300000` | Long/short snapshot cadence (resolution of the history series) |
@@ -94,6 +100,25 @@ The headline endpoint: price, OI, and funding change over any window for every c
              "dayNtlVlm": 3840737419.7, "hl24hChangePct": -1.67, "thenTs": "2026-08-26T14:17:33.462Z" }] }
 ```
 "Then" is the recorded tick nearest to `now - window` (±5% of the window, clamped 90s–15min; reported as `toleranceSec`). Missing coverage → `null` changes, never fabricated values.
+
+### `GET /v1/perps/emas` · `GET /v1/perps/:coin/emas`
+**The EMA board for your app in one request**: every live coin × timeframe × period, computed from Hyperliquid's official candles and joined with the live price. Per timeframe you get the raw EMAs plus the screener columns — `pxVsEmaPct` (% distance of the current price from each EMA) and `spreadPct` (fastest EMA vs slowest, the "cross" column: positive = 21 above 200, a sign flip = golden/death cross). Params: `tf` (comma list to subset timeframes), `coins` (comma list), `minOiUsd`, `limit`. Sorted by OI descending.
+
+```json
+{ "asOf": "2026-08-29T18:20:12.001Z", "periods": [21, 200], "timeframes": ["1h", "4h", "12h", "1d"], "count": 2,
+  "data": [{ "coin": "ENA", "asOf": "2026-08-29T18:20:11.512Z", "px": 0.15588, "oiUsd": 104501821.9,
+             "tfs": {
+               "1h": { "t": "2026-08-29T17:00:00.000Z", "tMs": 1788022800000, "nCandles": 5000,
+                        "ema": { "21": 0.158470, "200": 0.147728 },
+                        "pxVsEmaPct": { "21": -1.63, "200": 5.52 }, "spreadPct": 7.27 },
+               "4h": { "...": "same shape" }, "12h": { }, "1d": { } } }] }
+```
+
+Semantics worth knowing:
+- **Computation matches TradingView's `ta.ema`**: seeded with the SMA of the first `period` closes of the coin's *full* candle history (HL retains ~5000 candles per interval — EMA200 is fully converged on every timeframe), then `ema = α·close + (1−α)·ema` per closed candle, α = 2/(period+1). Screeners that feed only a few hundred candles into their EMA will disagree on high timeframes — this one won't.
+- `ema` values are as of the **last closed candle** (`t` = its open time); they only change when a candle closes, while `px` (and therefore `pxVsEmaPct`) is live from the latest tick. If you want the TradingView-style live line that treats the forming candle as if it closed now, compute `α·px + (1−α)·ema` client-side.
+- A listing younger than `period` candles reports `null` for that EMA until enough closes exist (`nCandles` tells you how many it has). `spreadPct` is `null` whenever either end is.
+- The collector seeds all coins within minutes of first boot (one paced candleSnapshot request per coin per timeframe), then stays current with ~1 hourly request per coin. New listings are picked up on the next hourly sweep; every coin is re-seeded from full history every `EMA_RESEED_DAYS` as a self-heal.
 
 ### `GET /v1/perps` · `GET /v1/perps/:coin`
 Universe list (sorted by OI) and a single-coin snapshot with `changes` for 1h/4h/24h inline. Coin names are matched case-insensitively (`btc` → `BTC`; exact match wins for names like `kPEPE`).

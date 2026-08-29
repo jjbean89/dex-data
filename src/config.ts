@@ -10,6 +10,31 @@ function numEnv(name: string, def: number): number {
 
 export type Role = "all" | "api" | "collector";
 
+// Timeframes the EMA tracker can maintain: Hyperliquid-native candle intervals
+// that are whole-hour multiples (epoch/UTC-aligned), so every one of them can be
+// advanced from the hourly close stream after the initial per-timeframe seed.
+export const EMA_TF_MS: Record<string, number> = {
+  "1h": 3_600_000,
+  "2h": 7_200_000,
+  "4h": 14_400_000,
+  "8h": 28_800_000,
+  "12h": 43_200_000,
+  "1d": 86_400_000,
+};
+
+function listEnv(name: string, def: string): string[] {
+  const raw = process.env[name];
+  const src = raw === undefined || raw.trim() === "" ? def : raw;
+  return [
+    ...new Set(
+      src
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s !== ""),
+    ),
+  ];
+}
+
 export const config = {
   role: (process.env.ROLE ?? "all") as Role,
   databaseUrl: process.env.DATABASE_URL ?? "",
@@ -34,6 +59,15 @@ export const config = {
   reverifyIntervalMs: numEnv("REVERIFY_INTERVAL_MS", 21_600_000),
   reverifyBatch: numEnv("REVERIFY_BATCH", 2_000),
 
+  // Moving-average tracker (EMAs per coin per timeframe, from HL's official candles).
+  emasEnabled: process.env.EMAS_ENABLED !== "false",
+  emaTimeframes: listEnv("EMA_TIMEFRAMES", "1h,4h,12h,1d").sort(
+    (a, b) => (EMA_TF_MS[a] ?? Infinity) - (EMA_TF_MS[b] ?? Infinity),
+  ),
+  emaPeriods: [...new Set(listEnv("EMA_PERIODS", "21,200").map(Number))].sort((a, b) => a - b),
+  emaReqDelayMs: numEnv("EMA_REQ_DELAY_MS", 2_000),
+  emaReseedDays: numEnv("EMA_RESEED_DAYS", 7),
+
   // HyperTracker census seed (optional; runs once when a key is present).
   hypertrackerApiKey: process.env.HYPERTRACKER_API_KEY ?? "",
   hypertrackerBaseUrl: process.env.HYPERTRACKER_BASE_URL ?? "https://ht-api.coinmarketman.com/api",
@@ -54,6 +88,23 @@ export function assertConfig(): void {
   }
   if (config.pollIntervalMs < 2_000) {
     throw new Error("POLL_INTERVAL_MS below 2000ms would burn the Hyperliquid rate-limit budget");
+  }
+  if (config.emasEnabled) {
+    for (const tf of config.emaTimeframes) {
+      if (!(tf in EMA_TF_MS)) {
+        throw new Error(`EMA_TIMEFRAMES: "${tf}" is not supported — use any of ${Object.keys(EMA_TF_MS).join(", ")}`);
+      }
+    }
+    if (config.emaTimeframes.length === 0) throw new Error("EMA_TIMEFRAMES must name at least one timeframe");
+    if (config.emaPeriods.length === 0) throw new Error("EMA_PERIODS must name at least one period");
+    for (const p of config.emaPeriods) {
+      if (!Number.isInteger(p) || p < 2 || p > 1_200) {
+        throw new Error(`EMA_PERIODS: "${p}" is invalid — use integers between 2 and 1200 (e.g. 21,200)`);
+      }
+    }
+    if (config.emaReqDelayMs < 500) {
+      throw new Error("EMA_REQ_DELAY_MS below 500ms risks the Hyperliquid rate-limit budget during seeding sweeps");
+    }
   }
   // Railway bills every byte through the public TCP proxy as egress; the collector
   // talks to Postgres constantly, so that misconfiguration quietly gets expensive.
