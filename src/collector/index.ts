@@ -1,6 +1,7 @@
 import { config } from "../config.js";
 import { sleep } from "../hl/client.js";
 import { log, logErr } from "../log.js";
+import { EMA_SWEEP_LAG_MS, syncEmas } from "./emas.js";
 import { syncFunding } from "./funding.js";
 import { startPositionsTracker } from "./positions.js";
 import { pruneOldData } from "./retention.js";
@@ -71,6 +72,42 @@ export function startCollector(): () => Promise<void> {
     }
   }
 
+  // EMA states only change when candles close, so the loop aligns to hour
+  // boundaries (+ a small lag so HL's closes are final). Per-coin cursors make
+  // extra passes nearly free, which keeps failure retries and post-boundary
+  // catch-up passes cheap.
+  async function emaLoop(): Promise<void> {
+    while (!stopped) {
+      const started = Date.now();
+      let failures = 0;
+      try {
+        const r = await syncEmas(isStopped);
+        if (r.coins === 0) {
+          // First boot: the asset registry fills on the first tick — retry shortly.
+          await pauseUntil(Date.now() + 30_000);
+          continue;
+        }
+        failures = r.failures;
+        if (r.requests > 0) {
+          log(
+            "emas",
+            `sweep: ${r.requests} candle fetches over ${r.coins} coins` +
+              `${r.seededTfs > 0 ? `, ${r.seededTfs} timeframes seeded` : ""}, ${r.rowsWritten} rows updated` +
+              `${failures > 0 ? `, ${failures} coins failed` : ""}`,
+          );
+        }
+      } catch (err) {
+        failures = 1;
+        logErr("emas", "sweep failed", err);
+      }
+      if (stopped) break;
+      const nextHour = (Math.floor(started / 3_600_000) + 1) * 3_600_000 + EMA_SWEEP_LAG_MS;
+      // Long sweeps (initial seeding) can cross an hour boundary: pauseUntil
+      // returns immediately then, and the follow-up pass sweeps up the new closes.
+      await pauseUntil(failures > 0 ? Date.now() + 600_000 : nextHour);
+    }
+  }
+
   async function retentionLoop(): Promise<void> {
     while (!stopped) {
       await pauseUntil(Date.now() + RETENTION_INTERVAL_MS);
@@ -112,13 +149,16 @@ export function startCollector(): () => Promise<void> {
   }
 
   const loops = [tickLoop(), rollupLoop(), fundingLoop(), retentionLoop()];
+  if (config.emasEnabled) {
+    loops.push(emaLoop());
+  }
   if (config.positionsEnabled && shouldSeed()) {
     loops.push(seedLoop());
   }
   const stopPositions = config.positionsEnabled ? startPositionsTracker(isStopped) : null;
   log(
     "collector",
-    `started: poll ${config.pollIntervalMs}ms, funding sweep every ${Math.round(config.fundingSyncIntervalMs / 60_000)}min, backfill ${config.fundingBackfillDays}d, positions ${config.positionsEnabled ? "on" : "off"}`,
+    `started: poll ${config.pollIntervalMs}ms, funding sweep every ${Math.round(config.fundingSyncIntervalMs / 60_000)}min, backfill ${config.fundingBackfillDays}d, positions ${config.positionsEnabled ? "on" : "off"}, emas ${config.emasEnabled ? `${config.emaPeriods.join("/")} × ${config.emaTimeframes.join("/")}` : "off"}`,
   );
 
   return async () => {
