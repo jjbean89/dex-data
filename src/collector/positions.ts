@@ -14,6 +14,10 @@ import { log, logErr } from "../log.js";
 // Residual drift (WS gaps, the pending→live handoff window) is healed by re-queuing:
 // on reconnect gaps, and by the slow re-verify sweep.
 
+const BOOTSTRAP_BATCH = 25;
+const IDLE_QUEUE_POLL_MS = 15_000;
+const STATS_INTERVAL_MS = 300_000;
+
 export function startPositionsTracker(isStopped: () => boolean): () => Promise<void> {
   interface PendingDelta {
     address: string;
@@ -122,57 +126,75 @@ export function startPositionsTracker(isStopped: () => boolean): () => Promise<v
     await flush().catch(() => undefined); // best-effort drain on shutdown
   }
 
+  // Picks pending wallets in batches (one queue query per BOOTSTRAP_BATCH wallets
+  // instead of per wallet) and backs off when the queue is empty — snapshots are
+  // minutes apart, so a short wait before a new wallet's baseline costs nothing.
   async function bootstrapLoop(): Promise<void> {
     while (!isStopped()) {
+      let batch: string[];
       try {
         const { rows } = await pool.query<{ address: string }>(
           `select address from traders where bootstrap_pending
-           order by last_trade_at desc nulls last limit 1`,
+           order by last_trade_at desc nulls last limit $1`,
+          [BOOTSTRAP_BATCH],
         );
-        const addr = rows[0]?.address;
-        if (!addr) {
-          await sleepStop(2_000);
-          continue;
-        }
-        const state = await hl.clearinghouseState(addr);
-        const pCoins: string[] = [];
-        const pSzi: number[] = [];
-        const pEntry: Array<number | null> = [];
-        for (const ap of state.assetPositions) {
-          const szi = parseFloat(ap.position.szi);
-          if (!Number.isFinite(szi) || szi === 0) continue;
-          pCoins.push(ap.position.coin);
-          pSzi.push(szi);
-          const entry = parseFloat(ap.position.entryPx ?? "");
-          pEntry.push(Number.isFinite(entry) ? entry : null);
-        }
-        const client = await pool.connect();
-        try {
-          await client.query("begin");
-          await client.query("delete from positions where address = $1", [addr]);
-          if (pCoins.length > 0) {
-            await client.query(
-              `insert into positions (address, coin, szi, entry_px, updated_at)
-               select $1::text, u.*, now() from unnest($2::text[], $3::float8[], $4::float8[]) as u`,
-              [addr, pCoins, pSzi, pEntry],
-            );
-          }
-          await client.query(
-            "update traders set bootstrap_pending = false, bootstrapped_at = now() where address = $1",
-            [addr],
-          );
-          await client.query("commit");
-        } catch (err) {
-          await client.query("rollback");
-          throw err;
-        } finally {
-          client.release();
-        }
+        batch = rows.map((r) => r.address);
       } catch (err) {
-        logErr("positions", "bootstrap failed", err);
-        await sleepStop(2_000);
+        logErr("positions", "bootstrap queue read failed", err);
+        await sleepStop(5_000);
+        continue;
       }
-      await sleepStop(config.bootstrapDelayMs);
+      if (batch.length === 0) {
+        await sleepStop(IDLE_QUEUE_POLL_MS);
+        continue;
+      }
+      for (const addr of batch) {
+        if (isStopped()) return;
+        try {
+          await bootstrapWallet(addr);
+        } catch (err) {
+          logErr("positions", "bootstrap failed", err);
+          await sleepStop(2_000);
+        }
+        await sleepStop(config.bootstrapDelayMs);
+      }
+    }
+  }
+
+  async function bootstrapWallet(addr: string): Promise<void> {
+    const state = await hl.clearinghouseState(addr);
+    const pCoins: string[] = [];
+    const pSzi: number[] = [];
+    const pEntry: Array<number | null> = [];
+    for (const ap of state.assetPositions) {
+      const szi = parseFloat(ap.position.szi);
+      if (!Number.isFinite(szi) || szi === 0) continue;
+      pCoins.push(ap.position.coin);
+      pSzi.push(szi);
+      const entry = parseFloat(ap.position.entryPx ?? "");
+      pEntry.push(Number.isFinite(entry) ? entry : null);
+    }
+    const client = await pool.connect();
+    try {
+      await client.query("begin");
+      await client.query("delete from positions where address = $1", [addr]);
+      if (pCoins.length > 0) {
+        await client.query(
+          `insert into positions (address, coin, szi, entry_px, updated_at)
+           select $1::text, u.*, now() from unnest($2::text[], $3::float8[], $4::float8[]) as u`,
+          [addr, pCoins, pSzi, pEntry],
+        );
+      }
+      await client.query(
+        "update traders set bootstrap_pending = false, bootstrapped_at = now() where address = $1",
+        [addr],
+      );
+      await client.query("commit");
+    } catch (err) {
+      await client.query("rollback");
+      throw err;
+    } finally {
+      client.release();
     }
   }
 
@@ -256,20 +278,26 @@ export function startPositionsTracker(isStopped: () => boolean): () => Promise<v
     }
   }
 
+  // Progress log line. Total wallet count comes from the planner's estimate — an
+  // exact count(*) is a full scan of an ever-growing table, too dear for a log line;
+  // the queue depth stays exact via the bootstrap_pending partial index.
   async function statsLoop(): Promise<void> {
     let lastCount = 0;
     while (!isStopped()) {
-      await sleepStop(60_000);
+      await sleepStop(STATS_INTERVAL_MS);
       if (isStopped()) break;
       try {
-        const { rows } = await pool.query<{ pending: number; tracked: number }>(
-          `select (count(*) filter (where bootstrap_pending))::int as pending,
-                  (count(*) filter (where not bootstrap_pending))::int as tracked
-           from traders`,
+        const { rows } = await pool.query<{ total_est: number; pending: number }>(
+          `select (select coalesce(nullif(c.reltuples, -1), 0)::float8
+                   from pg_class c join pg_namespace n on n.oid = c.relnamespace
+                   where c.relname = 'traders' and c.relkind = 'r' and n.nspname = current_schema()) as total_est,
+                  (select count(*)::int from traders where bootstrap_pending) as pending`,
         );
-        const rate = Math.round((tradeCount - lastCount) / 60);
+        const pending = rows[0]?.pending ?? 0;
+        const tracked = Math.max(0, Math.round(rows[0]?.total_est ?? 0) - pending);
+        const rate = Math.round((tradeCount - lastCount) / (STATS_INTERVAL_MS / 1000));
         lastCount = tradeCount;
-        log("positions", `~${rate} trades/s, wallets tracked ${rows[0]?.tracked ?? 0}, bootstrap queue ${rows[0]?.pending ?? 0}`);
+        log("positions", `~${rate} trades/s, wallets tracked ~${tracked}, bootstrap queue ${pending}`);
       } catch (err) {
         logErr("positions", "stats failed", err);
       }

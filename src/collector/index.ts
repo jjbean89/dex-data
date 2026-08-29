@@ -77,8 +77,8 @@ export function startCollector(): () => Promise<void> {
       if (stopped) break;
       try {
         const pruned = await pruneOldData();
-        if (pruned.ticks > 0 || pruned.candles5m > 0) {
-          log("retention", `pruned ${pruned.ticks} raw ticks, ${pruned.candles5m} 5m candles`);
+        if (pruned.ticks > 0 || pruned.candles5m > 0 || pruned.flatPositions > 0) {
+          log("retention", `pruned ${pruned.ticks} raw ticks, ${pruned.candles5m} 5m candles, ${pruned.flatPositions} flat positions`);
         }
       } catch (err) {
         logErr("retention", "prune failed", err);

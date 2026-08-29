@@ -81,6 +81,12 @@ function alignDown(ms: number, seconds: number): Date {
   return new Date(Math.floor(ms / b) * b);
 }
 
+// Everything before this instant is already rolled up. Ticks are stamped at collect
+// time and committed moments later, so each run re-covers a short overlap window to
+// absorb inserts that were in flight during the previous run.
+let rolledUpTo: number | null = null;
+const OVERLAP_MS = 90_000;
+
 async function rollupRange(fromMs: number, toMs: number): Promise<void> {
   for (const g of GRANULARITIES) {
     const from = alignDown(fromMs, g.seconds); // widen to the bucket edge so opens are correct
@@ -90,24 +96,44 @@ async function rollupRange(fromMs: number, toMs: number): Promise<void> {
   }
 }
 
-// Recompute the live bucket plus the previous two per granularity (covers late runs).
+// Recompute only buckets touched since the last successful run (watermark not
+// advanced on failure, so errored ranges are re-covered next time).
 export async function runIncrementalRollups(): Promise<void> {
   const now = Date.now();
-  for (const g of GRANULARITIES) {
-    const from = alignDown(now - 2 * g.seconds * 1000, g.seconds);
-    await pool.query(perpSql(g.perpTable), [from, new Date(now), g.seconds]);
-    await pool.query(marketSql(g.marketTable), [from, new Date(now), g.seconds]);
-  }
+  const from = rolledUpTo === null ? now - 2 * 3_600_000 : rolledUpTo - OVERLAP_MS;
+  await rollupRange(Math.min(from, now), now);
+  rolledUpTo = now;
 }
 
-// On startup, rebuild rollups over every raw tick still retained (day-sized chunks).
-// Self-heals candle tables after downtime or a schema reset.
+// On startup, resume rollups from the oldest live candle bucket (the partial bucket
+// being built when the previous process stopped). Only when a candle table is empty
+// (fresh schema) does this rebuild over every retained raw tick, in day-sized chunks.
 export async function bootstrapRollups(): Promise<number> {
-  const { rows } = await pool.query<{ min: Date | null }>("select min(ts) as min from perp_ticks");
-  const min = rows[0]?.min;
-  if (!min) return 0;
   const now = Date.now();
-  let chunkStart = alignDown(min.getTime(), 86_400).getTime();
+  const { rows } = await pool.query<{
+    tick_min: Date | null;
+    p5: Date | null;
+    p1h: Date | null;
+    m5: Date | null;
+    m1h: Date | null;
+  }>(
+    `select (select min(ts) from perp_ticks) as tick_min,
+            (select max(t) from perp_candles_5m) as p5,
+            (select max(t) from perp_candles_1h) as p1h,
+            (select max(t) from market_candles_5m) as m5,
+            (select max(t) from market_candles_1h) as m1h`,
+  );
+  const r = rows[0];
+  if (!r?.tick_min) {
+    rolledUpTo = now;
+    return 0;
+  }
+  const maxes = [r.p5, r.p1h, r.m5, r.m1h];
+  // Ticks never predate tick_min, so buckets older than it can't have changed.
+  const resume = maxes.some((m) => m === null)
+    ? r.tick_min.getTime()
+    : Math.max(Math.min(...maxes.map((m) => m!.getTime())), r.tick_min.getTime());
+  let chunkStart = resume;
   let chunks = 0;
   while (chunkStart < now) {
     const chunkEnd = Math.min(chunkStart + 86_400_000, now);
@@ -115,5 +141,6 @@ export async function bootstrapRollups(): Promise<number> {
     chunkStart = chunkEnd;
     chunks++;
   }
+  rolledUpTo = now;
   return chunks;
 }

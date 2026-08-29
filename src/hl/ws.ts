@@ -21,7 +21,7 @@ interface TradesFeedOpts {
 
 const PING_INTERVAL_MS = 30_000;
 const STALE_MS = 75_000;
-const COIN_REFRESH_MS = 60_000;
+const COIN_REFRESH_MS = 300_000; // new listings are rare; a few minutes' pickup delay is fine
 const GAP_NOTIFY_MS = 30_000;
 
 // Resilient subscriber to the HL trades channel for every live coin:

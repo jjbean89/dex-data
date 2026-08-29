@@ -1,5 +1,5 @@
 import { pool } from "../db/pool.js";
-import { aprPct, pctChange } from "./util.js";
+import { aprPct, cached, pctChange } from "./util.js";
 
 export interface TickRow {
   coin: string;
@@ -123,17 +123,24 @@ export interface AssetRow {
   first_seen: Date;
 }
 
+// The asset registry is a few hundred rows that change on the order of days —
+// resolve coin names against a briefly-cached copy instead of querying per request.
+function allAssets(): Promise<AssetRow[]> {
+  return cached("assets:all", 60_000, async () => {
+    const { rows } = await pool.query<AssetRow>(
+      "select coin, sz_decimals, max_leverage, is_delisted, first_seen from perp_assets",
+    );
+    return rows;
+  });
+}
+
 // Exact match first, then case-insensitive (HL names are case-sensitive, e.g. "kPEPE").
 export async function resolveCoin(raw: string): Promise<AssetRow | null> {
-  const { rows } = await pool.query<AssetRow>(
-    `select coin, sz_decimals, max_leverage, is_delisted, first_seen
-     from perp_assets
-     where coin = $1 or upper(coin) = upper($1)
-     order by (coin = $1) desc
-     limit 1`,
-    [raw],
-  );
-  return rows[0] ?? null;
+  const assets = await allAssets();
+  const exact = assets.find((a) => a.coin === raw);
+  if (exact) return exact;
+  const upper = raw.toUpperCase();
+  return assets.find((a) => a.coin.toUpperCase() === upper) ?? null;
 }
 
 export interface PerpListRow extends AssetRow {
@@ -381,17 +388,21 @@ export async function positioningAt(coin: string, targetMs: number): Promise<Pos
   return null;
 }
 
-export async function trackerCoverage(): Promise<{ tracked: number; pending: number; provisional: number }> {
-  const { rows } = await pool.query<{ tracked: number; pending: number; provisional: number }>(
-    `select
-       (count(*) filter (where not bootstrap_pending))::int as tracked,
-       (count(*) filter (where bootstrap_pending))::int as pending,
-       (select count(distinct p.address)
-          from positions p join traders t on t.address = p.address
-          where t.bootstrapped_at is null)::int as provisional
-     from traders`,
-  );
-  return rows[0] ?? { tracked: 0, pending: 0, provisional: 0 };
+// Coverage counts scan the whole traders and positions tables — cache them so
+// per-request positioning endpoints don't repeat two full scans each hit.
+export function trackerCoverage(): Promise<{ tracked: number; pending: number; provisional: number }> {
+  return cached("coverage:tracker", 60_000, async () => {
+    const { rows } = await pool.query<{ tracked: number; pending: number; provisional: number }>(
+      `select
+         (count(*) filter (where not bootstrap_pending))::int as tracked,
+         (count(*) filter (where bootstrap_pending))::int as pending,
+         (select count(distinct p.address)
+            from positions p join traders t on t.address = p.address
+            where t.bootstrapped_at is null)::int as provisional
+       from traders`,
+    );
+    return rows[0] ?? { tracked: 0, pending: 0, provisional: 0 };
+  });
 }
 
 // Venue OI (close) at or just before the target time, for market snapshot change math.
