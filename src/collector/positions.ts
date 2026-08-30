@@ -1,8 +1,8 @@
 import { config } from "../config.js";
 import { pool } from "../db/pool.js";
 import { hl, sleep } from "../hl/client.js";
-import { TradesFeed } from "../hl/ws.js";
 import { log, logErr } from "../log.js";
+import type { TradeTape } from "./tape.js";
 
 // Long/short trader tracking.
 //
@@ -18,7 +18,7 @@ const BOOTSTRAP_BATCH = 25;
 const IDLE_QUEUE_POLL_MS = 15_000;
 const STATS_INTERVAL_MS = 300_000;
 
-export function startPositionsTracker(isStopped: () => boolean): () => Promise<void> {
+export function startPositionsTracker(isStopped: () => boolean, tape: TradeTape): () => Promise<void> {
   interface PendingDelta {
     address: string;
     coin: string;
@@ -29,25 +29,16 @@ export function startPositionsTracker(isStopped: () => boolean): () => Promise<v
   const buffer = new Map<string, PendingDelta>();
   let tradeCount = 0;
 
-  const feed = new TradesFeed({
-    url: config.hlWsUrl,
-    getCoins: async () => {
-      const { rows } = await pool.query<{ coin: string }>(
-        "select coin from perp_assets where is_delisted = false",
-      );
-      return rows.map((r) => r.coin);
-    },
-    onTrades: (trades) => {
-      for (const t of trades) {
-        const sz = parseFloat(t.sz);
-        if (!Number.isFinite(sz) || sz === 0 || !Array.isArray(t.users)) continue;
-        tradeCount++;
-        addDelta(t.users[0], t.coin, sz, t.time);
-        addDelta(t.users[1], t.coin, -sz, t.time);
-      }
-    },
-    onGap: (gapMs) => void handleGap(gapMs),
+  tape.onTrades((trades) => {
+    for (const t of trades) {
+      const sz = parseFloat(t.sz);
+      if (!Number.isFinite(sz) || sz === 0 || !Array.isArray(t.users)) continue;
+      tradeCount++;
+      addDelta(t.users[0], t.coin, sz, t.time);
+      addDelta(t.users[1], t.coin, -sz, t.time);
+    }
   });
+  tape.onGap((gapMs) => void handleGap(gapMs));
 
   function addDelta(address: string, coin: string, delta: number, timeMs: number): void {
     const key = `${address}|${coin}`;
@@ -314,12 +305,10 @@ export function startPositionsTracker(isStopped: () => boolean): () => Promise<v
     }
   }
 
-  feed.start();
   const loops = [flushLoop(), bootstrapLoop(), snapshotLoop(), reverifyLoop(), statsLoop()];
   log("positions", `tracker started (flush ${config.positionsFlushMs}ms, bootstrap pace ${config.bootstrapDelayMs}ms, snapshots every ${Math.round(config.positionsSnapshotMs / 60_000)}min)`);
 
   return async () => {
-    feed.stop();
     await Promise.allSettled(loops);
     log("positions", "tracker stopped");
   };

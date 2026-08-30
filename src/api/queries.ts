@@ -433,6 +433,115 @@ export async function emaStatesFor(coin: string): Promise<EmaStateApiRow[]> {
   return rows;
 }
 
+// Liquidation series buckets. Sub-hour intervals aggregate the 5m candles, everything
+// else the permanent 1h candles; sums are exact because one liquidation event never
+// spans buckets (all fills of a forced order share one exchange timestamp).
+export const LIQ_BUCKET_MS: Record<string, number> = {
+  "5m": 300_000,
+  "15m": 900_000,
+  "1h": 3_600_000,
+  "4h": 14_400_000,
+  "12h": 43_200_000,
+  "1d": 86_400_000,
+};
+
+export interface LiqCandleRow {
+  t: Date;
+  long_ntl: number;
+  short_ntl: number;
+  long_events: number;
+  short_events: number;
+  long_fills: number;
+  short_fills: number;
+}
+
+const LIQ_CANDLE_SUMS = `
+  sum(long_ntl) as long_ntl, sum(short_ntl) as short_ntl,
+  sum(long_events)::int as long_events, sum(short_events)::int as short_events,
+  sum(long_fills)::int as long_fills, sum(short_fills)::int as short_fills`;
+
+// Most recent `limit` liquidation buckets within [from, to), ascending. Buckets with
+// no liquidations are omitted. coin = null aggregates the whole venue.
+export async function liqCandles(
+  coin: string | null,
+  bucketMs: number,
+  fromMs: number,
+  toMs: number,
+  limit: number,
+): Promise<LiqCandleRow[]> {
+  const table = bucketMs < 3_600_000 ? "liq_candles_5m" : "liq_candles_1h";
+  const { rows } = await pool.query<LiqCandleRow>(
+    `select * from (
+       select to_timestamp(floor(extract(epoch from t) / $1) * $1) as t, ${LIQ_CANDLE_SUMS}
+       from ${table}
+       where ($2::text is null or coin = $2)
+         and t >= to_timestamp($3 / 1000.0) and t < to_timestamp($4 / 1000.0)
+       group by 1
+     ) b order by t desc limit $5`,
+    [bucketMs / 1000, coin, fromMs, toMs, limit],
+  );
+  return rows.reverse();
+}
+
+export interface LiqTotalsRow {
+  coin: string;
+  long_ntl: number;
+  short_ntl: number;
+  long_events: number;
+  short_events: number;
+  long_fills: number;
+  short_fills: number;
+}
+
+// Per-coin liquidation totals over a trailing window, from raw fills (exact windows,
+// bounded by LIQ_RETENTION_DAYS). coin = null returns every coin with liquidations.
+export async function liqTotals(windowMs: number, coin: string | null): Promise<LiqTotalsRow[]> {
+  const { rows } = await pool.query<LiqTotalsRow>(
+    `select coin,
+       coalesce(sum(ntl) filter (where side = 'long'), 0) as long_ntl,
+       coalesce(sum(ntl) filter (where side = 'short'), 0) as short_ntl,
+       (count(distinct (wallet, ts)) filter (where side = 'long'))::int as long_events,
+       (count(distinct (wallet, ts)) filter (where side = 'short'))::int as short_events,
+       (count(*) filter (where side = 'long'))::int as long_fills,
+       (count(*) filter (where side = 'short'))::int as short_fills
+     from liq_fills
+     where ts >= now() - make_interval(secs => $1) and ($2::text is null or coin = $2)
+     group by coin`,
+    [windowMs / 1000, coin],
+  );
+  return rows;
+}
+
+export interface LiqFillRow {
+  tid: string; // bigint arrives as a string
+  ts: Date;
+  coin: string;
+  side: string;
+  px: number;
+  sz: number;
+  ntl: number;
+  wallet: string;
+  method: string | null;
+}
+
+// Freshness hint for the board: distinguishes "no liquidations lately" (live
+// timestamp, quiet market) from a recorder that isn't running yet.
+export async function lastLiqAt(): Promise<Date | null> {
+  const { rows } = await pool.query<{ max: Date | null }>("select max(ts) as max from liq_fills");
+  return rows[0]?.max ?? null;
+}
+
+export async function recentLiqFills(coin: string | null, limit: number): Promise<LiqFillRow[]> {
+  const { rows } = await pool.query<LiqFillRow>(
+    `select tid, ts, coin, side, px, sz, ntl, wallet, method
+     from liq_fills
+     where ($1::text is null or coin = $1)
+     order by ts desc limit $2`,
+    [coin, limit],
+  );
+  return rows;
+}
+
 // Venue OI (close) at or just before the target time, for market snapshot change math.
 export async function marketOiCloseAt(targetMs: number): Promise<number | null> {
   const { rows } = await pool.query<{ oi_usd_c: number | null }>(
