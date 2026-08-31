@@ -15,14 +15,19 @@ import { log, logErr } from "../log.js";
 // on reconnect gaps, and by the slow re-verify sweep.
 
 export function startPositionsTracker(isStopped: () => boolean): () => Promise<void> {
-  interface PendingDelta {
+  interface Fill {
+    px: number;
+    sz: number; // signed: + buys, - sells
+  }
+
+  interface PendingFills {
     address: string;
     coin: string;
-    delta: number;
+    fills: Fill[]; // in arrival order — apply_fills() replays them sequentially
     lastTimeMs: number;
   }
 
-  const buffer = new Map<string, PendingDelta>();
+  const buffer = new Map<string, PendingFills>();
   let tradeCount = 0;
 
   const feed = new TradesFeed({
@@ -36,23 +41,24 @@ export function startPositionsTracker(isStopped: () => boolean): () => Promise<v
     onTrades: (trades) => {
       for (const t of trades) {
         const sz = parseFloat(t.sz);
-        if (!Number.isFinite(sz) || sz === 0 || !Array.isArray(t.users)) continue;
+        const px = parseFloat(t.px);
+        if (!Number.isFinite(sz) || sz === 0 || !Number.isFinite(px) || !Array.isArray(t.users)) continue;
         tradeCount++;
-        addDelta(t.users[0], t.coin, sz, t.time);
-        addDelta(t.users[1], t.coin, -sz, t.time);
+        addFill(t.users[0], t.coin, sz, px, t.time);
+        addFill(t.users[1], t.coin, -sz, px, t.time);
       }
     },
     onGap: (gapMs) => void handleGap(gapMs),
   });
 
-  function addDelta(address: string, coin: string, delta: number, timeMs: number): void {
+  function addFill(address: string, coin: string, sz: number, px: number, timeMs: number): void {
     const key = `${address}|${coin}`;
     const cur = buffer.get(key);
     if (cur) {
-      cur.delta += delta;
+      cur.fills.push({ px, sz });
       if (timeMs > cur.lastTimeMs) cur.lastTimeMs = timeMs;
     } else {
-      buffer.set(key, { address, coin, delta, lastTimeMs: timeMs });
+      buffer.set(key, { address, coin, fills: [{ px, sz }], lastTimeMs: timeMs });
     }
   }
 
@@ -79,12 +85,12 @@ export function startPositionsTracker(isStopped: () => boolean): () => Promise<v
 
     const addrs: string[] = [];
     const coins: string[] = [];
-    const deltas: number[] = [];
+    const fillsJson: string[] = [];
     const lastByTrader = new Map<string, number>();
     for (const e of entries) {
       addrs.push(e.address);
       coins.push(e.coin);
-      deltas.push(e.delta);
+      fillsJson.push(JSON.stringify(e.fills));
       const prev = lastByTrader.get(e.address);
       if (prev === undefined || e.lastTimeMs > prev) lastByTrader.set(e.address, e.lastTimeMs);
     }
@@ -98,15 +104,14 @@ export function startPositionsTracker(isStopped: () => boolean): () => Promise<v
          last_trade_at = greatest(traders.last_trade_at, excluded.last_trade_at)`,
       [tAddrs, tTimes],
     );
+    // Replay each wallet's fill sequence through apply_fills(), which maintains
+    // both size and average entry price (see migrations/007).
     await pool.query(
-      `insert into positions (address, coin, szi, updated_at)
-       select u.address, u.coin, u.delta, now()
-       from unnest($1::text[], $2::text[], $3::float8[]) as u(address, coin, delta)
+      `select apply_fills(u.address, u.coin, u.fills)
+       from unnest($1::text[], $2::text[], $3::jsonb[]) as u(address, coin, fills)
        join traders t on t.address = u.address
-       where t.bootstrap_pending = false and u.delta <> 0
-       on conflict (address, coin) do update set
-         szi = positions.szi + excluded.szi, updated_at = now()`,
-      [addrs, coins, deltas],
+       where t.bootstrap_pending = false`,
+      [addrs, coins, fillsJson],
     );
   }
 
