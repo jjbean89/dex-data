@@ -1,5 +1,5 @@
 import { config } from "../config.js";
-import type { Candle, ClearinghouseState, FundingHistoryEntry, MetaAndAssetCtxs } from "./types.js";
+import type { Candle, ClearinghouseState, FundingHistoryEntry, MetaAndAssetCtxs, UserFill } from "./types.js";
 
 const MAX_RETRIES = 3;
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -55,6 +55,15 @@ export const hl = {
 
   // A wallet's current perp positions (weight 2 — cheap enough to poll in volume).
   clearinghouseState: (user: string) => info<ClearinghouseState>({ type: "clearinghouseState", user }),
+
+  // A wallet's fills in [startTime, endTime] (weight 20, at most 2000 fills returned).
+  userFillsByTime: (user: string, startTime: number, endTime?: number) =>
+    info<UserFill[]>({
+      type: "userFillsByTime",
+      user,
+      startTime,
+      ...(endTime !== undefined ? { endTime } : {}),
+    }),
 
   // Up to ~5000 most recent candles per interval are retained by HL.
   candleSnapshot: (coin: string, interval: string, startTime: number, endTime: number) =>

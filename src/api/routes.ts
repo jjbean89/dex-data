@@ -3,6 +3,7 @@ import { EMA_TF_MS, config } from "../config.js";
 import { pool } from "../db/pool.js";
 import {
   LATEST_MAX_AGE_MS,
+  LIQ_BUCKET_MS,
   changesBundle,
   emaStates,
   emaStatesFor,
@@ -10,12 +11,16 @@ import {
   latestPositioning,
   latestPositioningFor,
   latestTicks,
+  lastLiqAt,
+  liqCandles,
+  liqTotals,
   marketCandles,
   marketOiCloseAt,
   perpCandles,
   perpList,
   positioningAt,
   positioningHistory,
+  recentLiqFills,
   resolveCoin,
   singleTick,
   toleranceFor,
@@ -24,6 +29,9 @@ import {
   type ChangeRow,
   type ChangesBundle,
   type EmaStateApiRow,
+  type LiqCandleRow,
+  type LiqFillRow,
+  type LiqTotalsRow,
   type MarketCandleRow,
   type PerpCandleRow,
   type PositioningRow,
@@ -159,6 +167,106 @@ function serializeEntries(r: PositioningRow): Record<string, unknown> | null {
     pctShortsInProfit: r.n_short_entry > 0 ? (shortProfit / r.n_short_entry) * 100 : null,
     withKnownEntry: { long: r.n_long_entry, short: r.n_short_entry },
   };
+}
+
+// Resolves interval/from/to/limit for the liquidation series endpoints, which
+// support more intervals than the tick-candle endpoints (sums aggregate exactly).
+function liqRange(
+  q: Query,
+  reply: FastifyReply,
+): { interval: string; bucketMs: number; fromMs: number; toMs: number; limit: number } | null {
+  const interval = q.interval ?? "1h";
+  const bucketMs = LIQ_BUCKET_MS[interval];
+  if (!bucketMs) {
+    bad(reply, `invalid interval "${q.interval}" — use ${Object.keys(LIQ_BUCKET_MS).join(", ")}`);
+    return null;
+  }
+  const limit = parseLimit(q.limit, 300, CANDLE_LIMIT_MAX);
+  if (limit === null) {
+    bad(reply, "invalid limit");
+    return null;
+  }
+  const from = parseTimeMs(q.from);
+  const to = parseTimeMs(q.to);
+  if (from === null || to === null) {
+    bad(reply, "invalid from/to — use epoch ms, epoch seconds, or an ISO timestamp");
+    return null;
+  }
+  const toMs = to ?? Date.now() + bucketMs; // include the live partial bucket by default
+  const fromMs = from ?? toMs - limit * bucketMs;
+  if (fromMs >= toMs) {
+    bad(reply, "from must be before to");
+    return null;
+  }
+  return { interval, bucketMs, fromMs, toMs, limit };
+}
+
+function serializeLiqCandle(r: LiqCandleRow): Record<string, unknown> {
+  return {
+    t: r.t.toISOString(),
+    tMs: r.t.getTime(),
+    longs: { ntlUsd: r.long_ntl, events: r.long_events, fills: r.long_fills },
+    shorts: { ntlUsd: r.short_ntl, events: r.short_events, fills: r.short_fills },
+    totalNtlUsd: r.long_ntl + r.short_ntl,
+    events: r.long_events + r.short_events,
+  };
+}
+
+const ZERO_LIQ_TOTALS = {
+  longs: { ntlUsd: 0, events: 0, fills: 0 },
+  shorts: { ntlUsd: 0, events: 0, fills: 0 },
+  totalNtlUsd: 0,
+  events: 0,
+};
+
+function serializeLiqTotals(r: LiqTotalsRow | undefined): Record<string, unknown> {
+  if (!r) return ZERO_LIQ_TOTALS;
+  return {
+    longs: { ntlUsd: r.long_ntl, events: r.long_events, fills: r.long_fills },
+    shorts: { ntlUsd: r.short_ntl, events: r.short_events, fills: r.short_fills },
+    totalNtlUsd: r.long_ntl + r.short_ntl,
+    events: r.long_events + r.short_events,
+  };
+}
+
+function serializeLiqFill(r: LiqFillRow, includeCoin: boolean): Record<string, unknown> {
+  return {
+    t: r.ts.toISOString(),
+    tMs: r.ts.getTime(),
+    ...(includeCoin ? { coin: r.coin } : {}),
+    side: r.side,
+    px: r.px,
+    sz: r.sz,
+    ntlUsd: r.ntl,
+    wallet: r.wallet,
+    method: r.method,
+    tid: r.tid,
+  };
+}
+
+// Windows for the liquidation board/summaries: raw-fill exact, so bounded by the
+// liq_fills retention rather than tick retention.
+function parseLiqWindows(raw: string | undefined, reply: FastifyReply): Array<{ name: string; ms: number }> | null {
+  const names = csvParam(raw ?? "");
+  if (names === null) {
+    bad(reply, "invalid windows — use a comma-separated list like windows=1h,24h");
+    return null;
+  }
+  const list = names.length > 0 ? names : ["1h", "24h"];
+  const out: Array<{ name: string; ms: number }> = [];
+  for (const name of list) {
+    const ms = parseWindow(name);
+    if (ms === null || ms < 5 * 60_000) {
+      bad(reply, `invalid window "${name}" — use e.g. 15m, 1h, 4h, 24h, 7d`);
+      return null;
+    }
+    if (ms > config.liqRetentionDays * 86_400_000) {
+      bad(reply, `window "${name}" exceeds liquidation fill retention (${config.liqRetentionDays}d) — use the candle endpoints for longer ranges`);
+      return null;
+    }
+    out.push({ name, ms });
+  }
+  return out;
 }
 
 interface EmaCoinEntry {
@@ -299,9 +407,14 @@ export function registerRoutes(app: FastifyInstance): void {
       "GET /v1/perps/positioning?sort=traders|pctLong&dir=desc&limit=250",
       "GET /v1/perps/:coin/positioning",
       "GET /v1/perps/:coin/positioning/history?from=&to=&limit=288",
+      "GET /v1/perps/liquidations?windows=1h,24h&sort=ntl|events&dir=desc&limit=250",
+      "GET /v1/perps/:coin/liquidations?interval=5m|15m|1h|4h|12h|1d&from=&to=&limit=300",
+      "GET /v1/perps/:coin/liquidations/recent?limit=50",
       "GET /v1/market/snapshot",
       "GET /v1/market/oi?interval=5m|1h|1d&from=&to=&limit=300",
       "GET /v1/market/funding?interval=1h&smooth=8h&from=&to=&limit=300",
+      "GET /v1/market/liquidations?interval=5m|15m|1h|4h|12h|1d&from=&to=&limit=300",
+      "GET /v1/market/liquidations/recent?limit=50",
     ],
   }));
 
@@ -571,6 +684,81 @@ export function registerRoutes(app: FastifyInstance): void {
     return { coin: asset.coin, count: rows.length, data: rows.map((r) => serializePositioning(r, false)) };
   });
 
+  // Liquidation board: per-coin totals over trailing windows ("how much got
+  // liquidated in the last hour/day"), plus the venue-wide sum per window.
+  app.get("/v1/perps/liquidations", async (req, reply) => {
+    const q = req.query as Query;
+    const windows = parseLiqWindows(q.windows, reply);
+    if (!windows) return reply;
+    const sortRaw = q.sort ?? "ntl";
+    if (sortRaw !== "ntl" && sortRaw !== "events") return bad(reply, `invalid sort "${sortRaw}" — use ntl|events`);
+    const dir = q.dir ?? "desc";
+    if (dir !== "asc" && dir !== "desc") return bad(reply, 'dir must be "asc" or "desc"');
+    const limit = parseLimit(q.limit, 250, 500);
+    if (limit === null) return bad(reply, "invalid limit");
+
+    const [perWindow, lastAt] = await Promise.all([
+      Promise.all(windows.map((w) => cached(`liq:totals:${w.ms}`, CACHE_MS, () => liqTotals(w.ms, null)))),
+      cached("liq:lastAt", CACHE_MS, lastLiqAt),
+    ]);
+    const byWindow = perWindow.map((rows) => new Map(rows.map((r) => [r.coin, r])));
+    const coins = new Set<string>();
+    for (const rows of perWindow) for (const r of rows) coins.add(r.coin);
+    const rank = (r: LiqTotalsRow | undefined): number =>
+      r ? (sortRaw === "ntl" ? r.long_ntl + r.short_ntl : r.long_events + r.short_events) : 0;
+    const sign = dir === "desc" ? -1 : 1;
+    const ranked = [...coins]
+      .sort((a, b) => (rank(byWindow[0]!.get(a)) - rank(byWindow[0]!.get(b))) * sign || a.localeCompare(b))
+      .slice(0, limit);
+    const totals = Object.fromEntries(
+      windows.map((w, i) => {
+        const agg: LiqTotalsRow = { coin: "*", long_ntl: 0, short_ntl: 0, long_events: 0, short_events: 0, long_fills: 0, short_fills: 0 };
+        for (const r of perWindow[i]!) {
+          agg.long_ntl += r.long_ntl;
+          agg.short_ntl += r.short_ntl;
+          agg.long_events += r.long_events;
+          agg.short_events += r.short_events;
+          agg.long_fills += r.long_fills;
+          agg.short_fills += r.short_fills;
+        }
+        return [w.name, serializeLiqTotals(agg)];
+      }),
+    );
+    return {
+      windows: windows.map((w) => w.name),
+      lastLiqAt: lastAt ? lastAt.toISOString() : null,
+      count: ranked.length,
+      totals,
+      data: ranked.map((coin) => ({
+        coin,
+        windows: Object.fromEntries(windows.map((w, i) => [w.name, serializeLiqTotals(byWindow[i]!.get(coin))])),
+      })),
+    };
+  });
+
+  // Per-coin liquidation histogram (the "aggregated liquidations" pane series).
+  // Buckets with no liquidations are omitted — chart against the timestamps.
+  app.get("/v1/perps/:coin/liquidations", async (req, reply) => {
+    const { coin: coinRaw } = req.params as { coin: string };
+    const asset = await resolveCoin(coinRaw);
+    if (!asset) return notFound(reply, `no perp named "${coinRaw}"`);
+    const range = liqRange(req.query as Query, reply);
+    if (!range) return reply;
+    const rows = await liqCandles(asset.coin, range.bucketMs, range.fromMs, range.toMs, range.limit);
+    return { coin: asset.coin, interval: range.interval, count: rows.length, data: rows.map(serializeLiqCandle) };
+  });
+
+  // Raw liquidation prints, newest first (wallet-level detail is public on-chain data).
+  app.get("/v1/perps/:coin/liquidations/recent", async (req, reply) => {
+    const { coin: coinRaw } = req.params as { coin: string };
+    const asset = await resolveCoin(coinRaw);
+    if (!asset) return notFound(reply, `no perp named "${coinRaw}"`);
+    const limit = parseLimit((req.query as Query).limit, 50, 500);
+    if (limit === null) return bad(reply, "invalid limit");
+    const rows = await recentLiqFills(asset.coin, limit);
+    return { coin: asset.coin, count: rows.length, data: rows.map((r) => serializeLiqFill(r, false)) };
+  });
+
   app.get("/v1/perps/:coin", async (req, reply) => {
     const { coin: coinRaw } = req.params as { coin: string };
     const asset = await resolveCoin(coinRaw);
@@ -594,6 +782,11 @@ export function registerRoutes(app: FastifyInstance): void {
         : null;
     }
 
+    const [liq1h, liq24h] = await Promise.all([
+      liqTotals(3_600_000, asset.coin),
+      liqTotals(86_400_000, asset.coin),
+    ]);
+
     return {
       coin: asset.coin,
       szDecimals: asset.sz_decimals,
@@ -613,6 +806,10 @@ export function registerRoutes(app: FastifyInstance): void {
       dayNtlVlm: tick.day_ntl_vlm,
       hl24hChangePct: pctChange(tick.px, tick.prev_day_px),
       changes,
+      liquidations: {
+        "1h": serializeLiqTotals(liq1h[0]),
+        "24h": serializeLiqTotals(liq24h[0]),
+      },
     };
   });
 
@@ -701,6 +898,21 @@ export function registerRoutes(app: FastifyInstance): void {
     if (!range) return reply;
     const rows = await marketCandles(range.interval, range.fromMs, range.toMs, range.limit);
     return { interval: range.interval, count: rows.length, data: rows.map(serializeMarketCandle) };
+  });
+
+  // Venue-wide liquidation histogram: per-coin buckets summed across every coin.
+  app.get("/v1/market/liquidations", async (req, reply) => {
+    const range = liqRange(req.query as Query, reply);
+    if (!range) return reply;
+    const rows = await liqCandles(null, range.bucketMs, range.fromMs, range.toMs, range.limit);
+    return { interval: range.interval, count: rows.length, data: rows.map(serializeLiqCandle) };
+  });
+
+  app.get("/v1/market/liquidations/recent", async (req, reply) => {
+    const limit = parseLimit((req.query as Query).limit, 50, 500);
+    if (limit === null) return bad(reply, "invalid limit");
+    const rows = await recentLiqFills(null, limit);
+    return { count: rows.length, data: rows.map((r) => serializeLiqFill(r, true)) };
   });
 
   app.get("/v1/market/funding", async (req, reply) => {

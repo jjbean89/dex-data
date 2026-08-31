@@ -59,6 +59,16 @@ export const config = {
   reverifyIntervalMs: numEnv("REVERIFY_INTERVAL_MS", 21_600_000),
   reverifyBatch: numEnv("REVERIFY_BATCH", 2_000),
 
+  // Liquidation recorder (classifies tape trades via paced userFillsByTime
+  // verification and keeps per-coin liquidation fills + candles).
+  liquidationsEnabled: process.env.LIQUIDATIONS_ENABLED !== "false",
+  liqVerifyDelayMs: numEnv("LIQ_VERIFY_DELAY_MS", 3_000),
+  liqVerifyLagMs: numEnv("LIQ_VERIFY_LAG_MS", 8_000),
+  liqWalletCooldownMs: numEnv("LIQ_WALLET_COOLDOWN_MS", 60_000),
+  liqBackfillHours: numEnv("LIQ_BACKFILL_HOURS", 6),
+  liqBackfillWallets: numEnv("LIQ_BACKFILL_WALLETS", 250),
+  liqRetentionDays: numEnv("LIQ_RETENTION_DAYS", 90),
+
   // Moving-average tracker (EMAs per coin per timeframe, from HL's official candles).
   emasEnabled: process.env.EMAS_ENABLED !== "false",
   emaTimeframes: listEnv("EMA_TIMEFRAMES", "1h,4h,12h,1d").sort(
@@ -88,6 +98,15 @@ export function assertConfig(): void {
   }
   if (config.pollIntervalMs < 2_000) {
     throw new Error("POLL_INTERVAL_MS below 2000ms would burn the Hyperliquid rate-limit budget");
+  }
+  if (config.liquidationsEnabled) {
+    if (config.liqVerifyDelayMs < 1_000) {
+      throw new Error("LIQ_VERIFY_DELAY_MS below 1000ms would burn the Hyperliquid rate-limit budget (userFillsByTime is weight 20)");
+    }
+    if (config.liqRetentionDays < 1) throw new Error("LIQ_RETENTION_DAYS must be at least 1");
+    if (config.liqBackfillHours < 0 || config.liqBackfillHours > 168) {
+      throw new Error("LIQ_BACKFILL_HOURS must be between 0 and 168");
+    }
   }
   if (config.emasEnabled) {
     for (const tf of config.emaTimeframes) {

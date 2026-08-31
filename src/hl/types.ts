@@ -49,6 +49,27 @@ export interface ClearinghouseState {
   time: number;
 }
 
+// A fill from userFills/userFillsByTime. On a liquidation print, BOTH parties'
+// fills carry the `liquidation` object (verified empirically); `liquidatedUser`
+// names the forced wallet, and `side` is the queried wallet's side of the trade.
+export interface UserFill {
+  coin: string;
+  px: string;
+  sz: string;
+  side: "A" | "B"; // A = the queried wallet sold, B = bought
+  time: number;
+  dir: string;
+  hash: string;
+  oid: number;
+  crossed: boolean;
+  tid: number;
+  liquidation?: {
+    liquidatedUser?: string;
+    markPx: string;
+    method: "market" | "backstop";
+  };
+}
+
 export interface Candle {
   t: number; // bucket open time (ms)
   T: number; // bucket close time (ms)

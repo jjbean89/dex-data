@@ -7,6 +7,7 @@ Custom Hyperliquid market data service. Hyperliquid's public API only exposes th
 - **Funding history** — settled hourly rates (synced from HL back to whatever backfill depth you choose) plus recorded live rates
 - **Venue-wide aggregates** — total OI candles and OI-weighted average funding, the "Aggregated Open Interest" / "Aggregated Funding Rate" style series
 - **Long/short trader counts** — how many wallets are long vs. short each coin, with change over time (derived from the public trade tape + per-wallet position tracking; this exists in no API anywhere)
+- **Liquidations** — per-coin and venue-wide liquidation histograms (long vs. short notional, event counts) on any timeframe, trailing-window totals ("how much got liquidated in the last hour/day"), and a raw liquidation feed with wallets — reconstructed from public data; Hyperliquid publishes no liquidation feed at all
 - **EMAs for every coin on every timeframe** — EMA 21/200 on 1h/4h/12h/1d (all configurable), seeded from full candle history to match TradingView, plus the screener columns derived from them (price-vs-EMA %, EMA-vs-EMA cross spread) in one response
 
 One process polls `metaAndAssetCtxs` (every live perp in a single request) every 15s, rolls ticks up into 5m/1h candles, prunes raw data on a retention schedule, and runs the trades-WebSocket position tracker. A second process serves a read-only JSON API.
@@ -81,6 +82,11 @@ Deploys are zero-drama: the collector shuts down gracefully on SIGTERM and the D
 | `POSITIONS_SNAPSHOT_MS` | `300000` | Long/short snapshot cadence (resolution of the history series) |
 | `BOOTSTRAP_DELAY_MS` | `400` | Pacing between clearinghouseState wallet lookups |
 | `POSITIONS_FLUSH_MS` / `REVERIFY_INTERVAL_MS` / `REVERIFY_BATCH` | `5000` / `6h` / `2000` | Fill-delta write cadence; self-heal sweep |
+| `LIQUIDATIONS_ENABLED` | `true` | Liquidation recorder (see `/v1/perps/liquidations`) |
+| `LIQ_VERIFY_DELAY_MS` | `3000` | Pacing between userFillsByTime verification requests (weight 20 each) |
+| `LIQ_VERIFY_LAG_MS` / `LIQ_WALLET_COOLDOWN_MS` | `8000` / `60000` | Burst batching lag; per-wallet re-verify floor |
+| `LIQ_BACKFILL_HOURS` / `LIQ_BACKFILL_WALLETS` | `6` / `250` | Downtime heal: sweep recently-active wallets over the missed window |
+| `LIQ_RETENTION_DAYS` | `90` | Raw liquidation fill retention (candles follow the candle retentions) |
 | `HYPERTRACKER_API_KEY` | — | Enables the one-time starting-census import (see positioning docs below) |
 | `HYPERTRACKER_BASE_URL` / `HYPERTRACKER_REQ_DELAY_MS` | `https://ht-api.coinmarketman.com/api` / `1500` | Census source + pacing |
 | `PG_SSL_NO_VERIFY` | `false` | Accept self-signed Postgres TLS (Railway public proxy) |
@@ -162,6 +168,39 @@ Honest semantics — read this before charting it:
 - A wallet that never trades after launch is invisible until it does. Every wallet counts once (vaults and market makers included; note HLP itself is one wallet).
 - Positions are maintained from fills with the `[buyer, seller]` convention (verified empirically: 29/33 exact matches to 1e-9 against clearinghouseState, remainder explained by in-flight fills). WebSocket gaps trigger automatic re-baselining of recently active wallets, and a rolling re-verify sweep re-checks the longest-unverified wallets — drift self-heals within hours.
 
+### `GET /v1/perps/:coin/liquidations` · `GET /v1/market/liquidations`
+**Liquidation histograms** — the "aggregated liquidations" pane under a chart: long vs. short liquidated notional and event counts per bucket, per coin or venue-wide. Params: `interval` (`5m|15m|1h|4h|12h|1d`, default `1h`), `from`/`to`/`limit` as on the candle endpoints. Buckets with no liquidations are omitted — align by timestamp when charting. `events` counts forced liquidation orders (all fills of one forced order share a timestamp and wallet); `fills` counts raw prints.
+
+```json
+{ "coin": "BTC", "interval": "4h", "count": 2,
+  "data": [{ "t": "2026-08-30T12:00:00.000Z", "tMs": 1788091200000,
+             "longs":  { "ntlUsd": 184301.2, "events": 3, "fills": 9 },
+             "shorts": { "ntlUsd": 4291822.55, "events": 41, "fills": 118 },
+             "totalNtlUsd": 4476123.75, "events": 44 }] }
+```
+
+### `GET /v1/perps/liquidations?windows=1h,24h`
+**The liquidation board** — per-coin totals over trailing windows plus the venue-wide sum, in one response: "how many liquidations in the past hour / day, for every coin". Params: `windows` (comma list, `15m`…`{LIQ_RETENTION_DAYS}d`, default `1h,24h`), `sort` (`ntl|events`, applied to the first window), `dir`, `limit`. Windows are computed exactly from raw fills, not bucket-aligned.
+
+```json
+{ "windows": ["1h", "24h"], "lastLiqAt": "2026-08-30T17:09:58.664Z", "count": 37,
+  "totals": { "1h":  { "longs": { "ntlUsd": 12007.9, "events": 2, "fills": 2 },
+                        "shorts": { "ntlUsd": 861204.1, "events": 55, "fills": 240 },
+                        "totalNtlUsd": 873212.0, "events": 57 },
+              "24h": { "...": "same shape" } },
+  "data": [{ "coin": "BTC", "windows": { "1h": { "...": "..." }, "24h": { "...": "..." } } }] }
+```
+
+### `GET /v1/perps/:coin/liquidations/recent` · `GET /v1/market/liquidations/recent`
+The raw liquidation tape, newest first: `{t, side, px, sz, ntlUsd, wallet, method, tid}` (`side` = which side got liquidated; `wallet` = the liquidated address — public on-chain data; `method` = `market` for order-book liquidations, `backstop` for liquidator-vault takeovers). `/v1/perps/:coin` also carries a `liquidations` block with 1h/24h totals inline.
+
+How this works — and its honest semantics (Hyperliquid has **no** liquidation feed):
+- **Detection.** Forced closes print on the public trades WebSocket looking exactly like normal trades (same shape, real hash — verified empirically; the all-zero-hash prints are TWAP fills, not liquidations). But a wallet's fills from `userFillsByTime` carry an explicit `liquidation` marker on **both parties** of a liquidation print, naming the liquidated wallet. So the recorder classifies tape trades by verifying wallets: one paced request classifies *every* trade that wallet touched in the window.
+- **Coverage is deliberately concentrated, and measured.** The verify budget (`LIQ_VERIFY_DELAY_MS`, ~400 weight/min of HL's 1200/min at default) goes to the wallet covering the most unclassified trades. Market makers sit on one side of most flow (top 30 wallets ≈ ⅔ of all trades, measured live), and a forced order splinters into several prints, pushing cascade victims up the queue — so liquidation flow is caught at well above the raw trade-coverage rate. The collector logs its live classification coverage every 5 minutes; trades unclassified after 15 minutes are dropped from the queue and counted against coverage. Treat totals as a floor, tight in practice.
+- **Downtime heals.** Unlike open interest, liquidation history is recoverable after the fact: on boot and after WebSocket gaps the recorder sweeps recently-active wallets' fills over the missed window (`LIQ_BACKFILL_HOURS`). Deeper backfills are possible by temporarily raising it.
+- **Backstop liquidations** (liquidator-vault takeovers below ⅔ maintenance margin) don't print on the book; they're recorded when a swept wallet's fills reveal them, flagged `method: "backstop"`.
+- Idempotent by construction: fills are keyed by HL's trade id, and candle buckets are recomputed from raw fills in the same transaction, so re-discovery and late verification never double-count.
+
 ### `GET /health`
 `{ok, lastTickAt, tickAgeSec, ticksStale, liveCoins}` — wire this to Railway's healthcheck.
 
@@ -173,7 +212,7 @@ Honest semantics — read this before charting it:
 - **Retention:** raw ticks 14d → 5m candles 180d → 1h candles forever. `/changes` windows are bounded by raw retention; longer lookbacks come from the candle endpoints.
 - **Scale:** ~176 live coins × 4 ticks/min ≈ 1M rows/day raw, pruned at 14d ≈ 14M rows steady-state — comfortable for stock Postgres. If you later want years of raw ticks, TimescaleDB is a drop-in upgrade (deploy the `timescale/timescaledb` image as a Railway service instead of managed Postgres).
 - **Redundancy:** OI can't be backfilled, so if this becomes commercial, run a second collector against a second DB (different egress IP) as insurance.
-- **Cost levers**, in descending order of impact, if the Railway bill needs trimming: keep `DATABASE_URL` on the private network (see above); `POSITIONS_ENABLED=false` drops the WebSocket firehose, the wallet bootstrapper, and the two largest tables entirely; `POLL_INTERVAL_MS=30000` halves raw-tick volume and write load with candles still built from 10 ticks per 5m bucket; `REVERIFY_BATCH` scales the background clearinghouseState traffic; `RAW_RETENTION_DAYS` bounds the biggest table. Everything already in place — watermarked rollups, batched writes, response compression, capped retention — needs no tuning.
+- **Cost levers**, in descending order of impact, if the Railway bill needs trimming: keep `DATABASE_URL` on the private network (see above); `POSITIONS_ENABLED=false` drops the wallet bootstrapper and the two largest tables (the WebSocket firehose stays if liquidations are on); `LIQUIDATIONS_ENABLED=false` drops the liquidation recorder and its verification traffic; `POLL_INTERVAL_MS=30000` halves raw-tick volume and write load with candles still built from 10 ticks per 5m bucket; `REVERIFY_BATCH` scales the background clearinghouseState traffic; `RAW_RETENTION_DAYS` bounds the biggest table. Everything already in place — watermarked rollups, batched writes, response compression, capped retention — needs no tuning.
 
 ## Roadmap
 
@@ -181,5 +220,4 @@ Honest semantics — read this before charting it:
 - **Cross-venue funding** — `predictedFundings` returns HL vs Binance vs Bybit rates + intervals per coin → funding-arb endpoints.
 - **Leaderboards & signals** — OI-up-price-down divergence, funding flips, new-listing alerts; all derivable from existing tables.
 - **Gap repair** — backfill price candles from HL `candleSnapshot` after downtime (1m ≈ 3.5d retained upstream, 1h ≈ 208d).
-- **Liquidation tape** — the trades firehose is already ingested for position tracking; flagging and aggregating liquidation fills is an increment on top.
 - **Third-party hardening** — API keys + per-key rate limits, OpenAPI spec, SSE/WS push.
