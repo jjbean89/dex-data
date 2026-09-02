@@ -168,6 +168,28 @@ export const config = {
   liqWhaleWindow: windowEnv("LIQ_WHALE_WINDOW", "1h"),
   liqWhaleNotify: process.env.LIQ_WHALE_NOTIFY !== "false",
 
+  // Volume bars from the trade tape (per-bar notional, buy/sell split, TWAP share).
+  volumeEnabled: process.env.VOLUME_ENABLED !== "false",
+  volFlushMs: numEnv("VOL_FLUSH_MS", 10_000),
+  vol1mRetentionDays: numEnv("VOL_1M_RETENTION_DAYS", 30),
+
+  // "Volume leading price" detector: abnormal volume on flat price with
+  // positioning confirmation, evaluated on 5m bars.
+  volSignalsEnabled: process.env.VOL_SIGNALS_ENABLED !== "false",
+  volSignalCoins: listEnv("VOL_SIGNAL_COINS", ""), // empty = every live coin
+  volSignalBars: numEnv("VOL_SIGNAL_BARS", 3),
+  volSignalRvol: numEnv("VOL_SIGNAL_RVOL", 4),
+  volSignalMinBarRvol: numEnv("VOL_SIGNAL_MIN_BAR_RVOL", 1.5),
+  volSignalMinBarUsd: usdEnv("VOL_SIGNAL_MIN_BAR_USD", 250_000),
+  volSignalMaxMoveAtr: numEnv("VOL_SIGNAL_MAX_MOVE_ATR", 1.5),
+  volSignalMinOiPct: numEnv("VOL_SIGNAL_MIN_OI_PCT", 1),
+  volSignalMinImbalancePct: numEnv("VOL_SIGNAL_MIN_IMBALANCE_PCT", 60),
+  volSignalBreakoutAtr: numEnv("VOL_SIGNAL_BREAKOUT_ATR", 3),
+  volSignalMaxCoins: numEnv("VOL_SIGNAL_MAX_COINS", 15),
+  volSignalExpireMin: numEnv("VOL_SIGNAL_EXPIRE_MIN", 120),
+  volSignalMinHistoryHours: numEnv("VOL_SIGNAL_MIN_HISTORY_HOURS", 6),
+  volSignalNotify: process.env.VOL_SIGNAL_NOTIFY !== "false",
+
   // Moving-average tracker (EMAs per coin per timeframe, from HL's official candles).
   emasEnabled: process.env.EMAS_ENABLED !== "false",
   emaTimeframes: listEnv("EMA_TIMEFRAMES", "1h,4h,12h,1d").sort(
@@ -228,6 +250,29 @@ export function assertConfig(): void {
         throw new Error("LIQ_WHALE_WINDOW must be between 1m and 24h");
       }
     }
+  }
+  if (config.volumeEnabled) {
+    if (config.volFlushMs < 1_000) throw new Error("VOL_FLUSH_MS must be at least 1000");
+    if (config.vol1mRetentionDays < 1) throw new Error("VOL_1M_RETENTION_DAYS must be at least 1");
+  }
+  if (config.volumeEnabled && config.volSignalsEnabled) {
+    if (!Number.isInteger(config.volSignalBars) || config.volSignalBars < 1 || config.volSignalBars > 12) {
+      throw new Error("VOL_SIGNAL_BARS must be an integer between 1 and 12 (5m bars)");
+    }
+    if (config.volSignalRvol <= 1) throw new Error("VOL_SIGNAL_RVOL must be above 1");
+    if (config.volSignalMinBarRvol < 0 || config.volSignalMinBarRvol > config.volSignalRvol) {
+      throw new Error("VOL_SIGNAL_MIN_BAR_RVOL must be between 0 and VOL_SIGNAL_RVOL");
+    }
+    if (config.volSignalMaxMoveAtr <= 0) throw new Error("VOL_SIGNAL_MAX_MOVE_ATR must be positive");
+    if (config.volSignalBreakoutAtr <= config.volSignalMaxMoveAtr) {
+      throw new Error("VOL_SIGNAL_BREAKOUT_ATR must be larger than VOL_SIGNAL_MAX_MOVE_ATR");
+    }
+    if (config.volSignalMinImbalancePct < 50 || config.volSignalMinImbalancePct > 100) {
+      throw new Error("VOL_SIGNAL_MIN_IMBALANCE_PCT must be between 50 and 100");
+    }
+    if (config.volSignalMinOiPct < 0) throw new Error("VOL_SIGNAL_MIN_OI_PCT must be non-negative");
+    if (config.volSignalMaxCoins < 1) throw new Error("VOL_SIGNAL_MAX_COINS must be at least 1");
+    if (config.volSignalExpireMin < 5) throw new Error("VOL_SIGNAL_EXPIRE_MIN must be at least 5");
   }
   if (config.emasEnabled) {
     for (const tf of config.emaTimeframes) {

@@ -17,6 +17,8 @@ export async function pruneOldData(): Promise<{ ticks: number; candles5m: number
   await pool.query("delete from liq_candles_5m where t < now() - make_interval(days => $1)", [
     config.candles5mRetentionDays,
   ]);
+  await pool.query("delete from vol_candles_1m where t < now() - make_interval(days => $1)", [config.vol1mRetentionDays]);
+  await pool.query("delete from vol_candles_5m where t < now() - make_interval(days => $1)", [config.candles5mRetentionDays]);
   await pool.query("delete from ops_events where ts < now() - interval '14 days'");
   // Fully closed positions are dead weight: snapshots filter szi <> 0, and a later
   // fill simply re-inserts the row. Keep the ledger to open positions only.
