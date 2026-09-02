@@ -221,6 +221,8 @@ export const config = {
   whaleWindowHours: numEnv("WHALE_WINDOW_HOURS", 1),
   whaleWatchHours: numEnv("WHALE_WATCH_HOURS", 24),
   whaleWatchPollMs: numEnv("WHALE_WATCH_POLL_MS", 60_000),
+  // Whale alerts go to the same webhook as the liquidation alerts (LIQ_ALERT_WEBHOOK_URL).
+  whaleAlertEvents: listEnv("WHALE_ALERT_EVENTS", "funded,positioned"),
 
   pgSslNoVerify: process.env.PG_SSL_NO_VERIFY === "true",
 };
@@ -235,6 +237,13 @@ export function assertConfig(): void {
   if (config.pollIntervalMs < 2_000) {
     throw new Error("POLL_INTERVAL_MS below 2000ms would burn the Hyperliquid rate-limit budget");
   }
+  // The alert webhook is shared by liquidation and whale alerts.
+  if (!["auto", "json", "discord", "slack"].includes(config.liqAlertWebhookFormat)) {
+    throw new Error(`LIQ_ALERT_WEBHOOK_FORMAT must be one of auto|json|discord|slack, got "${config.liqAlertWebhookFormat}"`);
+  }
+  if (config.liqAlertWebhookUrl !== "" && !/^https?:\/\//i.test(config.liqAlertWebhookUrl)) {
+    throw new Error("LIQ_ALERT_WEBHOOK_URL must be an http(s) URL");
+  }
   if (config.liquidationsEnabled) {
     if (config.liqVerifyDelayMs < 1_000) {
       throw new Error("LIQ_VERIFY_DELAY_MS below 1000ms would burn the Hyperliquid rate-limit budget (userFillsByTime is weight 20)");
@@ -247,12 +256,6 @@ export function assertConfig(): void {
       if (config.liqAlertIntervalMs < 5_000) throw new Error("LIQ_ALERT_INTERVAL_MS must be at least 5000");
       if (config.liqAlertRearmPct <= 0 || config.liqAlertRearmPct > 100) {
         throw new Error("LIQ_ALERT_REARM_PCT must be between 1 and 100");
-      }
-      if (!["auto", "json", "discord", "slack"].includes(config.liqAlertWebhookFormat)) {
-        throw new Error(`LIQ_ALERT_WEBHOOK_FORMAT must be one of auto|json|discord|slack, got "${config.liqAlertWebhookFormat}"`);
-      }
-      if (config.liqAlertWebhookUrl !== "" && !/^https?:\/\//i.test(config.liqAlertWebhookUrl)) {
-        throw new Error("LIQ_ALERT_WEBHOOK_URL must be an http(s) URL");
       }
       for (const r of config.liqAlertRules) {
         if (r.windowMs > config.liqRetentionDays * 86_400_000) {
@@ -312,6 +315,11 @@ export function assertConfig(): void {
     }
     if (config.whaleWatchPollMs < 10_000) throw new Error("WHALE_WATCH_POLL_MS below 10000ms would burn clearinghouseState budget");
     if (config.bridgeRetentionDays < 1) throw new Error("BRIDGE_RETENTION_DAYS must be at least 1");
+    for (const e of config.whaleAlertEvents) {
+      if (e !== "funded" && e !== "positioned") {
+        throw new Error(`WHALE_ALERT_EVENTS: "${e}" is not an event — use any of funded, positioned`);
+      }
+    }
   }
   if (config.emasEnabled) {
     for (const tf of config.emaTimeframes) {

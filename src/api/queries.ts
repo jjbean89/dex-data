@@ -659,3 +659,33 @@ export async function openPositionsFor(addresses: string[]): Promise<WalletPosit
   );
   return rows;
 }
+
+export interface WhaleAlertRow {
+  id: string;
+  ts: Date;
+  kind: string;
+  address: string;
+  deposited_usd: number;
+  account_value: number | null;
+  total_ntl_pos: number | null;
+  is_new_account: boolean | null;
+  ledger_first_at: Date | null;
+  positions: Array<{ coin: string; side: string; sz: number; entryPx: number | null }>;
+  message: string;
+  delivered: boolean | null;
+  delivery_error: string | null;
+}
+
+export async function listWhaleAlerts(f: { kind?: string; address?: string; sinceMs?: number; limit: number }): Promise<WhaleAlertRow[]> {
+  const { rows } = await pool.query<WhaleAlertRow>(
+    `select id, ts, kind, address, deposited_usd, account_value, total_ntl_pos, is_new_account, ledger_first_at,
+            positions, message, delivered, delivery_error
+     from whale_alerts
+     where ($1::text is null or kind = $1)
+       and ($2::text is null or address = $2)
+       and ($3::timestamptz is null or ts >= $3)
+     order by ts desc, id desc limit $4`,
+    [f.kind ?? null, f.address ?? null, f.sinceMs !== undefined ? new Date(f.sinceMs) : null, f.limit],
+  );
+  return rows;
+}

@@ -19,6 +19,7 @@ import {
   openPositionsFor,
   recentBridgeDeposits,
   whaleWallets,
+  listWhaleAlerts,
   liqCandles,
   liqTotals,
   marketCandles,
@@ -601,6 +602,7 @@ export function registerRoutes(app: FastifyInstance): void {
       "GET /v1/alerts/rules",
       "GET /v1/whales/new?window=1h&minUsd=1000000&positioned=true|false&newOnly=false&limit=100",
       "GET /v1/bridge/deposits?window=24h&minUsd=100000&limit=100",
+      "GET /v1/whales/alerts?kind=funded|positioned&address=&since=&limit=100",
     ],
   }));
 
@@ -1397,6 +1399,47 @@ export function registerRoutes(app: FastifyInstance): void {
       bridge: serializeBridgeStatus(status),
       count: rows.length,
       data: rows.map((r) => serializeWhale(r, byAddress.get(r.address) ?? [], marks)),
+    };
+  });
+
+  // Whale alert history, newest first: what was (or would have been) pushed to the webhook.
+  app.get("/v1/whales/alerts", async (req, reply) => {
+    const q = req.query as Query;
+    const limit = parseLimit(q.limit, 100, 1000);
+    if (limit === null) return bad(reply, "invalid limit");
+    const since = parseTimeMs(q.since);
+    if (since === null) return bad(reply, "invalid since — use epoch ms, epoch seconds, or an ISO timestamp");
+    if (q.kind !== undefined && q.kind !== "" && q.kind !== "funded" && q.kind !== "positioned") {
+      return bad(reply, `invalid kind "${q.kind}" — use funded|positioned`);
+    }
+    const address = q.address?.trim().toLowerCase();
+    if (address !== undefined && address !== "" && !/^0x[0-9a-f]{40}$/.test(address)) return bad(reply, "invalid address");
+    const rows = await listWhaleAlerts({
+      ...(q.kind ? { kind: q.kind } : {}),
+      ...(address ? { address } : {}),
+      ...(since !== undefined ? { sinceMs: since } : {}),
+      limit,
+    });
+    return {
+      webhook: config.liqAlertWebhookUrl !== "",
+      events: config.whaleAlertEvents,
+      count: rows.length,
+      data: rows.map((r) => ({
+        id: r.id,
+        t: r.ts.toISOString(),
+        tMs: r.ts.getTime(),
+        kind: r.kind,
+        address: r.address,
+        depositedUsd: r.deposited_usd,
+        accountValueUsd: r.account_value,
+        totalNtlPosUsd: r.total_ntl_pos,
+        isNewAccount: r.is_new_account,
+        ledgerFirstAt: r.ledger_first_at ? r.ledger_first_at.toISOString() : null,
+        positions: r.positions,
+        message: r.message,
+        delivered: r.delivered,
+        deliveryError: r.delivery_error,
+      })),
     };
   });
 
