@@ -161,6 +161,21 @@ export const config = {
   hypertrackerDeepHistory: process.env.HYPERTRACKER_DEEP_HISTORY === "true",
   hypertrackerDeepStart: process.env.HYPERTRACKER_DEEP_START ?? "2025-04-04T00:00:00Z",
 
+  // Whale discovery: Arbitrum bridge deposit watcher + per-wallet HL enrichment.
+  whalesEnabled: process.env.WHALES_ENABLED !== "false",
+  arbitrumRpcUrl: process.env.ARBITRUM_RPC_URL ?? "https://arb1.arbitrum.io/rpc",
+  arbitrumUsdcAddress: (process.env.ARBITRUM_USDC_ADDRESS ?? "0xaf88d065e77c8cC2239327C5EDb3A432268e5831").toLowerCase(),
+  hlBridgeAddress: (process.env.HL_BRIDGE_ADDRESS ?? "0x2Df1c51E09aECF9cacB7bc98cB1742757f163dF7").toLowerCase(),
+  bridgePollMs: numEnv("BRIDGE_POLL_MS", 15_000),
+  bridgeConfirmations: numEnv("BRIDGE_CONFIRMATIONS", 10),
+  bridgeBackfillHours: numEnv("BRIDGE_BACKFILL_HOURS", 6),
+  bridgeMinRecordUsd: numEnv("BRIDGE_MIN_RECORD_USD", 1_000),
+  bridgeRetentionDays: numEnv("BRIDGE_RETENTION_DAYS", 90),
+  whaleMinUsd: numEnv("WHALE_MIN_USD", 1_000_000),
+  whaleWindowHours: numEnv("WHALE_WINDOW_HOURS", 1),
+  whaleWatchHours: numEnv("WHALE_WATCH_HOURS", 24),
+  whaleWatchPollMs: numEnv("WHALE_WATCH_POLL_MS", 60_000),
+
   pgSslNoVerify: process.env.PG_SSL_NO_VERIFY === "true",
 };
 
@@ -199,6 +214,30 @@ export function assertConfig(): void {
         }
       }
     }
+  }
+  if (config.whalesEnabled) {
+    if (!/^https?:\/\//.test(config.arbitrumRpcUrl)) {
+      throw new Error("ARBITRUM_RPC_URL must be an http(s) JSON-RPC endpoint (or set WHALES_ENABLED=false)");
+    }
+    for (const [name, v] of [["ARBITRUM_USDC_ADDRESS", config.arbitrumUsdcAddress], ["HL_BRIDGE_ADDRESS", config.hlBridgeAddress]]) {
+      if (!/^0x[0-9a-f]{40}$/.test(v!)) throw new Error(`${name} must be a 20-byte hex address`);
+    }
+    if (config.bridgePollMs < 2_000) throw new Error("BRIDGE_POLL_MS below 2000ms would hammer the Arbitrum RPC");
+    if (config.bridgeConfirmations < 0 || config.bridgeConfirmations > 1_000) {
+      throw new Error("BRIDGE_CONFIRMATIONS must be between 0 and 1000");
+    }
+    if (config.bridgeBackfillHours < 0 || config.bridgeBackfillHours > 168) {
+      throw new Error("BRIDGE_BACKFILL_HOURS must be between 0 and 168");
+    }
+    if (config.whaleMinUsd <= 0) throw new Error("WHALE_MIN_USD must be positive");
+    if (config.whaleWindowHours <= 0 || config.whaleWindowHours > 168) {
+      throw new Error("WHALE_WINDOW_HOURS must be between 0 and 168");
+    }
+    if (config.whaleWatchHours < 1 || config.whaleWatchHours > 720) {
+      throw new Error("WHALE_WATCH_HOURS must be between 1 and 720");
+    }
+    if (config.whaleWatchPollMs < 10_000) throw new Error("WHALE_WATCH_POLL_MS below 10000ms would burn clearinghouseState budget");
+    if (config.bridgeRetentionDays < 1) throw new Error("BRIDGE_RETENTION_DAYS must be at least 1");
   }
   if (config.emasEnabled) {
     for (const tf of config.emaTimeframes) {

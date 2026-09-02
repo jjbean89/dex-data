@@ -11,6 +11,7 @@ import { runSeeder, seedComplete, shouldSeed } from "./seed-hypertracker.js";
 import { bootstrapRollups, runIncrementalRollups } from "./rollups.js";
 import { startTradeTape } from "./tape.js";
 import { collectTick } from "./ticks.js";
+import { startWhaleTracker } from "./whales.js";
 
 const RETENTION_INTERVAL_MS = 3_600_000;
 
@@ -165,9 +166,10 @@ export function startCollector(): () => Promise<void> {
   if (config.liquidationsEnabled && config.liqAlertsEnabled && config.liqAlertRules.length > 0) {
     stops.push(startLiqAlerts(isStopped));
   }
+  if (config.whalesEnabled) stops.push(startWhaleTracker(isStopped, tape));
   log(
     "collector",
-    `started: poll ${config.pollIntervalMs}ms, funding sweep every ${Math.round(config.fundingSyncIntervalMs / 60_000)}min, backfill ${config.fundingBackfillDays}d, positions ${config.positionsEnabled ? "on" : "off"}, liquidations ${config.liquidationsEnabled ? "on" : "off"}, liq alerts ${config.liquidationsEnabled && config.liqAlertsEnabled ? `${config.liqAlertRules.length} rules` : "off"}, emas ${config.emasEnabled ? `${config.emaPeriods.join("/")} × ${config.emaTimeframes.join("/")}` : "off"}`,
+    `started: poll ${config.pollIntervalMs}ms, funding sweep every ${Math.round(config.fundingSyncIntervalMs / 60_000)}min, backfill ${config.fundingBackfillDays}d, positions ${config.positionsEnabled ? "on" : "off"}, liquidations ${config.liquidationsEnabled ? "on" : "off"}, liq alerts ${config.liquidationsEnabled && config.liqAlertsEnabled ? `${config.liqAlertRules.length} rules` : "off"}, emas ${config.emasEnabled ? `${config.emaPeriods.join("/")} × ${config.emaTimeframes.join("/")}` : "off"}, whales ${config.whalesEnabled ? `≥$${config.whaleMinUsd.toLocaleString("en-US")}/${config.whaleWindowHours}h` : "off"}`,
   );
 
   return async () => {
