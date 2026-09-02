@@ -35,6 +35,73 @@ function listEnv(name: string, def: string): string[] {
   ];
 }
 
+// Liquidation alert rules: "COIN:WINDOW:THRESHOLD[:SIDES]" entries, comma-separated.
+//   COIN      Hyperliquid coin name as it prints on the tape (BTC, ETH, kPEPE …)
+//   WINDOW    trailing window, e.g. 15m, 1h, 24h (1d also accepted)
+//   THRESHOLD USD notional; k/m/b suffixes allowed (15M = 15_000_000)
+//   SIDES     long | short | total | both (default both = long and short evaluated
+//             separately; total = long + short as one number)
+// Each configured side becomes its own rule with its own armed state.
+export type LiqAlertSide = "long" | "short" | "total";
+
+export interface LiqAlertRule {
+  coin: string;
+  window: string;
+  windowMs: number;
+  side: LiqAlertSide;
+  thresholdUsd: number;
+}
+
+export const LIQ_ALERT_DEFAULT_RULES =
+  "BTC:15m:15M,BTC:1h:40M,BTC:24h:100M,ETH:15m:10M,ETH:1h:15M,ETH:24h:100M";
+
+function parseUsd(raw: string): number | null {
+  const m = /^\$?([\d_]*\.?\d+(?:e\d+)?)\s*([kmb])?$/i.exec(raw.trim());
+  if (!m) return null;
+  const n = Number(m[1]!.replace(/_/g, ""));
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const mult = m[2] === undefined ? 1 : { k: 1e3, m: 1e6, b: 1e9 }[m[2].toLowerCase()]!;
+  return n * mult;
+}
+
+function parseWindowMs(raw: string): number | null {
+  const m = /^(\d{1,3})(m|h|d)$/.exec(raw.trim());
+  if (!m) return null;
+  const n = parseInt(m[1]!, 10);
+  if (n === 0) return null;
+  return n * (m[2] === "m" ? 60_000 : m[2] === "h" ? 3_600_000 : 86_400_000);
+}
+
+export function parseLiqAlertRules(raw: string): LiqAlertRule[] {
+  const out = new Map<string, LiqAlertRule>();
+  for (const entry of raw.split(",").map((s) => s.trim()).filter((s) => s !== "")) {
+    const parts = entry.split(":").map((s) => s.trim());
+    if (parts.length < 3 || parts.length > 4) {
+      throw new Error(`LIQ_ALERT_RULES: "${entry}" — expected COIN:WINDOW:THRESHOLD[:SIDES]`);
+    }
+    const [coin, window, thresholdRaw, sidesRaw = "both"] = parts as [string, string, string, string?];
+    if (coin === "") throw new Error(`LIQ_ALERT_RULES: "${entry}" — empty coin`);
+    const windowMs = parseWindowMs(window);
+    if (windowMs === null || windowMs < 60_000) {
+      throw new Error(`LIQ_ALERT_RULES: "${entry}" — invalid window "${window}" (use e.g. 15m, 1h, 24h)`);
+    }
+    const thresholdUsd = parseUsd(thresholdRaw);
+    if (thresholdUsd === null) {
+      throw new Error(`LIQ_ALERT_RULES: "${entry}" — invalid threshold "${thresholdRaw}" (use e.g. 15M, 500k, 15000000)`);
+    }
+    const sidesKey = (sidesRaw ?? "both").toLowerCase();
+    const sides: LiqAlertSide[] =
+      sidesKey === "both" ? ["long", "short"] : sidesKey === "long" || sidesKey === "short" || sidesKey === "total" ? [sidesKey] : [];
+    if (sides.length === 0) {
+      throw new Error(`LIQ_ALERT_RULES: "${entry}" — invalid sides "${sidesRaw}" (use long, short, total, or both)`);
+    }
+    for (const side of sides) {
+      out.set(`${coin}|${window}|${side}`, { coin, window, windowMs, side, thresholdUsd });
+    }
+  }
+  return [...out.values()];
+}
+
 export const config = {
   role: (process.env.ROLE ?? "all") as Role,
   databaseUrl: process.env.DATABASE_URL ?? "",
@@ -68,6 +135,14 @@ export const config = {
   liqBackfillHours: numEnv("LIQ_BACKFILL_HOURS", 6),
   liqBackfillWallets: numEnv("LIQ_BACKFILL_WALLETS", 250),
   liqRetentionDays: numEnv("LIQ_RETENTION_DAYS", 90),
+
+  // Liquidation threshold alerts (evaluated by the collector from liq_fills).
+  liqAlertsEnabled: process.env.LIQ_ALERTS_ENABLED !== "false",
+  liqAlertRules: parseLiqAlertRules(process.env.LIQ_ALERT_RULES?.trim() || LIQ_ALERT_DEFAULT_RULES),
+  liqAlertIntervalMs: numEnv("LIQ_ALERT_INTERVAL_MS", 30_000),
+  liqAlertRearmPct: numEnv("LIQ_ALERT_REARM_PCT", 80),
+  liqAlertWebhookUrl: process.env.LIQ_ALERT_WEBHOOK_URL?.trim() ?? "",
+  liqAlertWebhookFormat: (process.env.LIQ_ALERT_WEBHOOK_FORMAT ?? "auto") as "auto" | "json" | "discord" | "slack",
 
   // Moving-average tracker (EMAs per coin per timeframe, from HL's official candles).
   emasEnabled: process.env.EMAS_ENABLED !== "false",
@@ -121,6 +196,23 @@ export function assertConfig(): void {
     if (config.liqRetentionDays < 1) throw new Error("LIQ_RETENTION_DAYS must be at least 1");
     if (config.liqBackfillHours < 0 || config.liqBackfillHours > 168) {
       throw new Error("LIQ_BACKFILL_HOURS must be between 0 and 168");
+    }
+    if (config.liqAlertsEnabled) {
+      if (config.liqAlertIntervalMs < 5_000) throw new Error("LIQ_ALERT_INTERVAL_MS must be at least 5000");
+      if (config.liqAlertRearmPct <= 0 || config.liqAlertRearmPct > 100) {
+        throw new Error("LIQ_ALERT_REARM_PCT must be between 1 and 100");
+      }
+      if (!["auto", "json", "discord", "slack"].includes(config.liqAlertWebhookFormat)) {
+        throw new Error(`LIQ_ALERT_WEBHOOK_FORMAT must be one of auto|json|discord|slack, got "${config.liqAlertWebhookFormat}"`);
+      }
+      if (config.liqAlertWebhookUrl !== "" && !/^https?:\/\//i.test(config.liqAlertWebhookUrl)) {
+        throw new Error("LIQ_ALERT_WEBHOOK_URL must be an http(s) URL");
+      }
+      for (const r of config.liqAlertRules) {
+        if (r.windowMs > config.liqRetentionDays * 86_400_000) {
+          throw new Error(`LIQ_ALERT_RULES: window "${r.window}" for ${r.coin} exceeds LIQ_RETENTION_DAYS (${config.liqRetentionDays}d)`);
+        }
+      }
     }
   }
   if (config.whalesEnabled) {
