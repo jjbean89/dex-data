@@ -122,6 +122,7 @@ Deploys are zero-drama: the collector shuts down gracefully on SIGTERM and the D
 | `WHALE_WATCH_HOURS` / `WHALE_WATCH_POLL_MS` | `24` / `60000` | How long, and how often, a flagged wallet is polled on HL for a position opened after funding |
 | `WHALE_POSITION_MIN_USD` | `1000000` | The `positioned` alert needs this much notional in positions opened after funding (new coins or side flips vs. what the wallet held at its first deposit; adding to an existing position never counts); `0` = any size |
 | `WHALE_ALERT_EVENTS` | `funded,positioned` | Which whale events to push to `LIQ_ALERT_WEBHOOK_URL` (shared with the liquidation alerts) |
+| `WHALE_FUNDED_MAX_AGE_HOURS` | `24` | `funded` alerts only for wallets whose first-ever Hyperliquid activity is this recent |
 | `HYPERTRACKER_API_KEY` | — | Enables the one-time starting-census import (see positioning docs below) |
 | `HYPERTRACKER_BASE_URL` / `HYPERTRACKER_REQ_DELAY_MS` | `https://ht-api.coinmarketman.com/api` / `1500` | Census source + pacing |
 | `PG_SSL_NO_VERIFY` | `false` | Accept self-signed Postgres TLS (Railway public proxy) |
@@ -351,9 +352,9 @@ How this works — Hyperliquid's API cannot answer this question by itself:
 - Requests: the bridge watcher costs ~8 RPC calls per minute (head + logs per poll) plus one batched block lookup per poll that found deposits; whale polling is a handful of weight-2 calls per minute at most.
 
 ### `GET /v1/whales/alerts?kind=funded|positioned`
-**Whale alerts** — the push feed behind the board. Two events per whale episode, each sent once (state survives restarts):
+**Whale alerts** — the push feed behind the board. Two events per whale episode, each sent at most once (state survives restarts):
 
-- `funded` — a wallet crossed `WHALE_MIN_USD`. Sent right after the tracker's first Hyperliquid check, so it already says whether the account is brand new and what its perps account is worth.
+- `funded` — a **fresh** wallet crossed `WHALE_MIN_USD`: its first-ever Hyperliquid ledger entry is within `WHALE_FUNDED_MAX_AGE_HOURS` (default 24h). Sent right after the tracker's first Hyperliquid check, which reads the wallet's ledger from time zero, so it says how new the account is and what its perps account is worth. A known whale topping up is logged as skipped and never pushed — it still appears on `/v1/whales/new` and still gets a `positioned` alert.
 - `positioned` — a flagged wallet opened a position it did not hold when it was funded: a new coin, or a side flip, never an addition to an existing position. Sent once per episode, the first time such positions add up to `WHALE_POSITION_MIN_USD` of notional, with those positions (side, notional, entry), how many positions the wallet already held before funding, total notional, and account value.
 
 Every alert is logged (`[whales] ALERT …`), stored, and — with `LIQ_ALERT_WEBHOOK_URL` set, the same webhook the liquidation alerts use — POSTed. Discord and Slack incoming-webhook URLs are auto-detected and receive a one-line message ending in the wallet's explorer link; anything else gets `{type: "whale_funded" | "whale_positioned", alert: {…}}` with the structured fields (`opened` lists the newly opened positions, `positions` the wallet's whole book). Delivery is retried, and the stored row records `delivered` / `deliveryError`. `WHALE_ALERT_EVENTS` narrows which events are sent. Params: `kind`, `address`, `since` (epoch ms/s or ISO), `limit` (default 100, max 1000).
