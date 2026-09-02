@@ -9,6 +9,9 @@ Custom Hyperliquid market data service. Hyperliquid's public API only exposes th
 - **Long/short trader counts** — how many wallets are long vs. short each coin, with change over time (derived from the public trade tape + per-wallet position tracking; this exists in no API anywhere)
 - **Liquidations** — per-coin and venue-wide liquidation histograms (long vs. short notional, event counts) on any timeframe, trailing-window totals ("how much got liquidated in the last hour/day"), and a raw liquidation feed with wallets — reconstructed from public data; Hyperliquid publishes no liquidation feed at all
 - **Liquidation alerts** — threshold rules per coin × trailing window (15m / 1h / 24h) × side; one alert per crossing, persisted and queryable, optionally pushed to a webhook (Discord/Slack/JSON)
+- **Large liquidated accounts** — every wallet liquidated for more than a threshold ($10M by default) in one burst, with the per-coin breakdown, collected as it happens
+- **Volume bars for every coin** — per-bar notional from the public trade tape (1m/5m/1h), split by taker side with TWAP flow flagged; Hyperliquid only exposes a rolling 24h number, so like OI this exists only if you record it
+- **Volume-leading-price signals** — abnormal volume while price is still flat, confirmed by open-interest growth or one-sided taker flow: the accumulation that precedes a move, with breakout confirmation after the fact
 - **EMAs for every coin on every timeframe** — EMA 21/200 on 1h/4h/12h/1d (all configurable), seeded from full candle history to match TradingView, plus the screener columns derived from them (price-vs-EMA %, EMA-vs-EMA cross spread) in one response
 - **New whale wallets** — every wallet that bridged $1M+ (configurable) into Hyperliquid in the last hour, whether the account is brand new, and whether it has opened a position yet (with the positions) — from the Arbitrum bridge's deposit logs joined to per-wallet Hyperliquid state; Hyperliquid's own API has no deposit feed at all
 
@@ -93,7 +96,23 @@ Deploys are zero-drama: the collector shuts down gracefully on SIGTERM and the D
 | `LIQ_ALERT_RULES` | `BTC:15m:15M,BTC:1h:40M,BTC:24h:100M,ETH:15m:10M,ETH:1h:15M,ETH:24h:100M` | `COIN:WINDOW:THRESHOLD[:SIDES]` list; sides `long`/`short`/`total`/`both` (default `both` = longs and shorts alerted separately) |
 | `LIQ_ALERT_INTERVAL_MS` | `30000` | Rule evaluation cadence |
 | `LIQ_ALERT_REARM_PCT` | `80` | A fired rule re-arms once its window value drops below this % of the threshold |
-| `LIQ_ALERT_WEBHOOK_URL` / `LIQ_ALERT_WEBHOOK_FORMAT` | — / `auto` | Optional push target; format `auto` picks `discord`/`slack` from the host, else raw `json` |
+| `LIQ_ALERT_WEBHOOK_URL` / `LIQ_ALERT_WEBHOOK_FORMAT` | — / `auto` | Optional push target for alerts and whale liquidations; format `auto` picks `discord`/`slack` from the host, else raw `json` |
+| `LIQ_WHALE_THRESHOLD` | `10M` | Collect any wallet liquidated for at least this much (USD) in one burst; `0` disables |
+| `LIQ_WHALE_WINDOW` | `1h` | Max gap between a wallet's liquidation fills for them to count as one burst |
+| `LIQ_WHALE_NOTIFY` | `true` | Also push whale liquidations to the webhook |
+| `VOLUME_ENABLED` | `true` | Volume bars from the trade tape (see `/v1/perps/:coin/volume`) |
+| `VOL_FLUSH_MS` / `VOL_1M_RETENTION_DAYS` | `10000` / `30` | Write cadence; 1m bar retention (5m follow `CANDLES_5M_RETENTION_DAYS`, 1h forever) |
+| `VOL_SIGNALS_ENABLED` | `true` | Volume-leading-price detector (see `/v1/signals`) |
+| `VOL_SIGNAL_COINS` | — (all) | Restrict the detector to a comma list of coins |
+| `VOL_SIGNAL_BARS` | `3` | Window length in 5m bars |
+| `VOL_SIGNAL_RVOL` / `VOL_SIGNAL_MIN_BAR_RVOL` | `4` / `1.5` | Window volume vs. baseline; floor every bar must clear (sustained, not one print) |
+| `VOL_SIGNAL_MIN_BAR_USD` | `250k` | Ignore coins trading less than this per 5m bar |
+| `VOL_SIGNAL_MAX_MOVE_ATR` | `1.5` | "Flat": net move ≤ this × the coin's typical 5m range |
+| `VOL_SIGNAL_MIN_OI_PCT` / `VOL_SIGNAL_MIN_IMBALANCE_PCT` | `1` / `60` | Positioning confirmation: OI change over the window, or taker share one way |
+| `VOL_SIGNAL_BREAKOUT_ATR` | `3` | Confirms a signal when a later bar (or the move since) exceeds this × range |
+| `VOL_SIGNAL_MAX_COINS` | `15` | More coins than this triggering together = market-wide event, notified once |
+| `VOL_SIGNAL_EXPIRE_MIN` / `VOL_SIGNAL_MIN_HISTORY_HOURS` | `120` / `6` | Signal lifetime without a breakout; bars needed before a coin is eligible |
+| `VOL_SIGNAL_NOTIFY` | `true` | Push signals and confirmations to the webhook |
 | `WHALES_ENABLED` | `true` | Bridge deposit watcher + whale wallet tracking (see `/v1/whales/new`) |
 | `ARBITRUM_RPC_URL` | `https://arb1.arbitrum.io/rpc` | Any Arbitrum One JSON-RPC endpoint (public works; a free provider key is steadier) |
 | `ARBITRUM_USDC_ADDRESS` / `HL_BRIDGE_ADDRESS` | native USDC / Bridge2 | Override for testnet |
@@ -215,6 +234,45 @@ How this works — and its honest semantics (Hyperliquid has **no** liquidation 
 - **Backstop liquidations** (liquidator-vault takeovers below ⅔ maintenance margin) don't print on the book; they're recorded when a swept wallet's fills reveal them, flagged `method: "backstop"`.
 - Idempotent by construction: fills are keyed by HL's trade id, and candle buckets are recomputed from raw fills in the same transaction, so re-discovery and late verification never double-count.
 
+### `GET /v1/perps/:coin/volume?interval=1m|5m|1h`
+**Volume bars from the trade tape.** Hyperliquid's API only carries a rolling 24h volume per coin; these are real per-bar numbers, summed from every print on the trades WebSocket. Each bar: OHLC of trade prices, `ntlUsd`, taker-side split (`buyNtlUsd` / `sellNtlUsd` / `deltaUsd` / `buySharePct`), `twapNtlUsd` (flow from TWAP prints — the all-zero-hash fills), size, `vwap`, `trades`. `from`/`to`/`limit` as on the candle endpoints. Bars with no prints are omitted. Recorded from the moment the collector starts — like open interest there is no backfill, and a restart loses the seconds between its last flush and the boot.
+
+### `GET /v1/perps/volume?bars=3`
+**The volume board**: every coin's relative volume over the last `bars` 5m bars against its own baseline, sorted by `rvol`, plus the numbers the detector below uses: `pxMovePct` and `moveAtr` (the move in units of the coin's typical 5m range), `buySharePct`, `twapSharePct`, `oiChangePct`. Params: `bars` (1–12), `sort` (`rvol|volume`), `minBarUsd`, `limit`. Cached 30s. `rvol` is `null` until a coin has a day of bars.
+
+Baseline = the median 5m notional over the trailing 24h, blended 50/50 with the median of the same time-of-day slots over the prior week once a week of bars exists (volume has a strong intraday cycle; a plain trailing average fires every day at the US open). Medians, not means, so one spike bar doesn't poison its own baseline for a day. The live bar counts once a minute of it has elapsed, with its expectation pro-rated.
+
+### `GET /v1/signals`
+**Volume leading price.** The collector evaluates every coin each minute and fires a *buildup* signal when abnormal volume arrives while price is still flat — and something confirms positions are being built rather than churned:
+
+| Condition | Default |
+|---|---|
+| Window volume vs. baseline | ≥ 4× over 3 bars (15m), every bar ≥ 1.5× |
+| Minimum size | ≥ $250k per 5m bar |
+| Price flat | net move ≤ 1.5 × typical 5m range |
+| Positioning | open interest moved ≥ 1% over the window, **or** taker flow ≥ 60% one way |
+
+`bias` is `long` / `short` / `mixed` from the taker split (and OI direction). A signal stays `open` (one per coin) and is **confirmed** when a subsequent 5m bar, or the cumulative move since the signal, exceeds 3× the coin's range; it **expires** after 2h otherwise. Confirmed vs. expired counts are the detector's scorecard — tune the thresholds from `/v1/signals?status=confirmed` against `status=expired` once a couple of weeks of bars exist.
+
+Params: `coin`, `status` (`open|confirmed|expired`), `since`, `marketWide`, `limit`. Each row carries the window numbers at fire time (`rvol`, `volNtlUsd` vs `expectedNtlUsd`, `pxMovePct`, `atrPct`, `oiChangePct`, `buySharePct`, `twapSharePct`), the confirmation (`breakoutMovePct`, `breakoutRvol`, `confirmedAt`) and delivery status.
+
+```json
+{ "count": 1,
+  "data": [{ "id": "12", "coin": "HYPE", "firedAt": "2026-09-02T17:41:02.113Z", "status": "confirmed", "bias": "long", "marketWide": false,
+             "window": { "from": "2026-09-02T17:25:00.000Z", "to": "2026-09-02T17:35:00.000Z", "bars": 3 },
+             "volNtlUsd": 9120000, "expectedNtlUsd": 1610000, "rvol": 5.66, "minBarRvol": 2.9,
+             "pxFrom": 43.71, "pxTo": 43.86, "pxMovePct": 0.34, "atrPct": 0.41,
+             "oiFromUsd": 412000000, "oiToUsd": 425600000, "oiChangePct": 3.3, "buySharePct": 64.2, "twapSharePct": 8.1,
+             "confirmedAt": "2026-09-02T18:03:02.510Z", "breakoutMovePct": 4.8, "breakoutRvol": 61.3,
+             "message": "HYPE: 5.7x volume over 15min ($9.12M vs $1.61M expected), price +0.34% (typical 5m range 0.41%), OI +3.30%, taker buys 64% → long buildup",
+             "delivered": true }] }
+```
+
+Honest semantics:
+- **Market-wide events are separated out.** When more than `VOL_SIGNAL_MAX_COINS` coins trigger in one pass (a venue-wide move, a macro print), the rows are recorded with `marketWide: true` and the webhook gets a single summary instead of one message per coin.
+- **Known false positives**: funding settlement at the top of the hour, large TWAPs (`twapSharePct` tells you when the "accumulation" is a scheduled order), listings younger than `VOL_SIGNAL_MIN_HISTORY_HOURS`, and market-maker churn — the OI/flow confirmation exists to drop the last one.
+- Signals and confirmations go to `LIQ_ALERT_WEBHOOK_URL` as `📈 …` / `✅ …` messages (JSON envelopes `volume_buildup`, `volume_breakout`, `volume_market_wide`).
+
 ### `GET /v1/alerts` · `GET /v1/alerts/rules`
 **Liquidation threshold alerts.** The collector evaluates every rule in `LIQ_ALERT_RULES` — a coin, a trailing window, a threshold in USD notional, and which side(s) — against the exact trailing-window totals from the raw liquidation fills (the same numbers `/v1/perps/liquidations` reports). Out of the box:
 
@@ -244,9 +302,27 @@ Semantics:
 - **Edge-triggered with hysteresis.** A rule fires once when its window value crosses the threshold, then stays `active` until the value drops below `LIQ_ALERT_REARM_PCT`% of the threshold (fills aging out of the trailing window). A cascade produces one alert per rule, not one per evaluation, and a value hovering around the threshold doesn't flap. Once re-armed, a fresh crossing fires again.
 - **State survives restarts** (`liq_alert_rules`): an alert already sent is not re-sent after a redeploy, and a crossing that happened during downtime fires on boot with the current value.
 - **Values are the recorder's floors.** Liquidations are classified a few seconds to minutes after they print (and backfilled after downtime), so the window value can keep climbing after an alert; the alert carries the value at detection time. See the liquidation recorder's coverage notes above.
-- **Delivery.** Every alert is logged (`[alerts] ALERT …`), stored, and — with `LIQ_ALERT_WEBHOOK_URL` set — POSTed as JSON. Discord and Slack incoming-webhook URLs are auto-detected and receive a one-line message (`content` / `text`); anything else gets `{ "type": "liquidation_threshold", "alert": { …same shape as /v1/alerts… } }`. Three attempts with backoff; the outcome lands in `delivered` / `deliveryError` on the row and failures are also written to `ops_events`.
+- **Delivery.** Every alert is logged (`[alerts] ALERT …`), stored, and — with `LIQ_ALERT_WEBHOOK_URL` set — POSTed as JSON. Discord and Slack incoming-webhook URLs are auto-detected and receive a one-line message (`content` / `text`); anything else gets `{ "type": "liquidation_threshold", "alert": { …same shape as /v1/alerts… } }` (whale liquidations arrive on the same webhook as `{ "type": "whale_liquidation", "whale": { … } }`). Three attempts with backoff; the outcome lands in `delivered` / `deliveryError` on the row and failures are also written to `ops_events`.
 - Rule changes take effect on the next collector boot. Coin names are Hyperliquid's exact spelling (`BTC`, `ETH`, `kPEPE`); an unknown coin is logged as a warning rather than silently never firing.
 
+### `GET /v1/market/liquidations/whales`
+**Large liquidated accounts.** Every wallet whose liquidations in one burst add up to at least `LIQ_WHALE_THRESHOLD` ($10M by default), newest first, with what got liquidated. A burst is one wallet's liquidation fills, across all coins, with no gap longer than `LIQ_WHALE_WINDOW` — so a position taken down in several partial liquidations over a few minutes is one record, and a wallet liquidated on BTC and ETH in the same cascade is one record with both. Params: `wallet`, `coin`, `since`, `minNtlUsd`, `active` (`true` = burst still going), `limit` (default 50, max 500).
+
+```json
+{ "count": 1,
+  "data": [{ "id": "7", "wallet": "0x…", "explorer": "https://app.hyperliquid.xyz/explorer/address/0x…",
+             "detectedAt": "2026-09-02T15:20:41.002Z", "from": "2026-09-02T15:18:02.113Z", "to": "2026-09-02T15:20:19.870Z",
+             "toMs": 1788362419870, "durationSec": 138,
+             "ntlUsd": 13000000, "thresholdUsd": 10000000, "events": 3, "fills": 9,
+             "coins": [{ "coin": "BTC", "side": "long", "ntlUsd": 6000000, "events": 1, "fills": 4 },
+                       { "coin": "ETH", "side": "long", "ntlUsd": 7000000, "events": 2, "fills": 5 }],
+             "active": false, "delivered": true, "deliveryError": null }] }
+```
+
+Semantics:
+- **Records grow while the burst is open.** A wallet is recorded the moment its burst crosses the threshold (and pushed to the webhook once, as `🐋 …`); further liquidations within the window fold into the same record (`ntlUsd`, `events`, `coins`, `to` update) until the window passes with no new fills, then it freezes. Later liquidations of the same wallet start a new record.
+- **Late discovery still counts.** The tracker keys on when fills were recorded, not when they traded, so liquidations the recorder classifies late or backfills after downtime are collected too (a burst older than the window is recorded already closed).
+- Wallets are public on-chain addresses; `explorer` links to Hyperliquid's own explorer. Totals are the recorder's floors (see coverage notes above) — a large liquidation is exactly the flow the verification queue prioritises, so these are caught reliably in practice.
 ### `GET /v1/whales/new?window=1h&minUsd=1000000`
 **New whale wallets**: every address whose deposits into Hyperliquid over the trailing window total at least `minUsd`, with what the tracker has learned about each on Hyperliquid — account value, account age, when it first traded, and its open positions marked at the live price. Params: `window` (`1m`…`{BRIDGE_RETENTION_DAYS}d`, default `1h`), `minUsd` (default `WHALE_MIN_USD`), `positioned` (`true` = only wallets with an open position right now, `false` = only funded-but-idle ones), `newOnly=true` (only brand-new accounts — first ledger entry ever is inside this deposit episode), `limit`. Sorted by deposited amount.
 
@@ -283,7 +359,7 @@ The raw deposit tape behind the whale board, newest first: `{t, address, usdc, t
 - **Windows are rolling** (now vs. exactly N ago), matching how HL's own `prevDayPx` behaves. `hl24hChangePct` (HL's official number) is included alongside for comparison.
 - **Funding is hourly on Hyperliquid.** `funding_hr` on ticks is the live predicted rate; `funding-history` is the settled ledger. Early history (pre-mid-2023) settled every 8h — rows carry whatever HL reports.
 - **Delisted coins** stop ticking but keep their history; new listings are picked up automatically on the next tick.
-- **Retention:** raw ticks 14d → 5m candles 180d → 1h candles forever. `/changes` windows are bounded by raw retention; longer lookbacks come from the candle endpoints.
+- **Retention:** raw ticks 14d → 5m candles 180d → 1h candles forever (volume: 1m bars 30d, 5m 180d, 1h forever). `/changes` windows are bounded by raw retention; longer lookbacks come from the candle endpoints.
 - **Scale:** ~176 live coins × 4 ticks/min ≈ 1M rows/day raw, pruned at 14d ≈ 14M rows steady-state — comfortable for stock Postgres. If you later want years of raw ticks, TimescaleDB is a drop-in upgrade (deploy the `timescale/timescaledb` image as a Railway service instead of managed Postgres).
 - **Redundancy:** OI can't be backfilled, so if this becomes commercial, run a second collector against a second DB (different egress IP) as insurance.
 - **Cost levers**, in descending order of impact, if the Railway bill needs trimming: keep `DATABASE_URL` on the private network (see above); `POSITIONS_ENABLED=false` drops the wallet bootstrapper and the two largest tables (the WebSocket firehose stays if liquidations are on); `LIQUIDATIONS_ENABLED=false` drops the liquidation recorder and its verification traffic; `WHALES_ENABLED=false` drops the bridge watcher (no HL budget to speak of, but one fewer external dependency); `POLL_INTERVAL_MS=30000` halves raw-tick volume and write load with candles still built from 10 ticks per 5m bucket; `REVERIFY_BATCH` scales the background clearinghouseState traffic; `RAW_RETENTION_DAYS` bounds the biggest table. Everything already in place — watermarked rollups, batched writes, response compression, capped retention — needs no tuning.

@@ -1,7 +1,9 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { EMA_TF_MS, config, type LiqAlertSide } from "../config.js";
 import { liqWindowTotals, listLiqAlerts, loadLiqAlertRules, sideSlice, type LiqAlertRow, type LiqAlertRuleRow } from "../db/liq-alerts.js";
+import { listLiqWhales, type LiqWhaleRow } from "../db/liq-whales.js";
 import { pool } from "../db/pool.js";
+import { VOL_TABLES, listVolSignals, oiUsdAt, volCandles, volumeContext, volumeMetrics, windowBuckets, type VolBarRow, type VolSignalRow } from "../db/volume.js";
 import {
   LATEST_MAX_AGE_MS,
   LIQ_BUCKET_MS,
@@ -317,6 +319,82 @@ function serializeLiqFill(r: LiqFillRow, includeCoin: boolean): Record<string, u
   };
 }
 
+function serializeLiqWhale(r: LiqWhaleRow): Record<string, unknown> {
+  return {
+    id: r.id,
+    wallet: r.wallet,
+    explorer: `https://app.hyperliquid.xyz/explorer/address/${r.wallet}`,
+    detectedAt: r.detected_at.toISOString(),
+    from: r.from_ts.toISOString(),
+    to: r.to_ts.toISOString(),
+    toMs: r.to_ts.getTime(),
+    durationSec: Math.round((r.to_ts.getTime() - r.from_ts.getTime()) / 1000),
+    ntlUsd: r.ntl,
+    thresholdUsd: r.threshold_usd,
+    events: r.events,
+    fills: r.fills,
+    coins: r.coins.map((c) => ({ coin: c.coin, side: c.side, ntlUsd: c.ntl, events: c.events, fills: c.fills })),
+    active: r.active,
+    delivered: r.delivered,
+    deliveryError: r.delivery_error,
+  };
+}
+
+function serializeVolBar(r: VolBarRow): Record<string, unknown> {
+  const ntl = r.buy_ntl + r.sell_ntl;
+  const sz = r.buy_sz + r.sell_sz;
+  return {
+    t: r.t.toISOString(),
+    tMs: r.t.getTime(),
+    o: r.o,
+    h: r.h,
+    l: r.l,
+    c: r.c,
+    ntlUsd: ntl,
+    buyNtlUsd: r.buy_ntl,
+    sellNtlUsd: r.sell_ntl,
+    deltaUsd: r.buy_ntl - r.sell_ntl,
+    buySharePct: ntl > 0 ? (r.buy_ntl / ntl) * 100 : null,
+    twapNtlUsd: r.twap_ntl,
+    sz,
+    vwap: sz > 0 ? ntl / sz : null,
+    trades: r.buy_n + r.sell_n,
+  };
+}
+
+function serializeVolSignal(r: VolSignalRow): Record<string, unknown> {
+  return {
+    id: r.id,
+    coin: r.coin,
+    firedAt: r.fired_at.toISOString(),
+    firedAtMs: r.fired_at.getTime(),
+    status: r.status,
+    bias: r.bias,
+    marketWide: r.market_wide,
+    window: { from: r.t_from.toISOString(), to: r.t_to.toISOString(), bars: r.bars },
+    volNtlUsd: r.vol_ntl,
+    expectedNtlUsd: r.baseline_ntl,
+    rvol: r.rvol,
+    minBarRvol: r.min_bar_rvol,
+    pxFrom: r.px_from,
+    pxTo: r.px_to,
+    pxMovePct: r.px_move_pct,
+    atrPct: r.atr_pct,
+    oiFromUsd: r.oi_from,
+    oiToUsd: r.oi_to,
+    oiChangePct: r.oi_change_pct,
+    buySharePct: r.buy_share_pct,
+    twapSharePct: r.twap_share_pct,
+    confirmedAt: r.confirmed_at ? r.confirmed_at.toISOString() : null,
+    breakoutMovePct: r.breakout_move_pct,
+    breakoutRvol: r.breakout_rvol,
+    closedAt: r.closed_at ? r.closed_at.toISOString() : null,
+    message: r.message,
+    delivered: r.delivered,
+    deliveryError: r.delivery_error,
+  };
+}
+
 function parseAlertSide(raw: string | undefined): LiqAlertSide | undefined | null {
   if (raw === undefined || raw === "") return undefined;
   return raw === "long" || raw === "short" || raw === "total" ? raw : null;
@@ -515,12 +593,118 @@ export function registerRoutes(app: FastifyInstance): void {
       "GET /v1/market/funding?interval=1h&smooth=8h&from=&to=&limit=300",
       "GET /v1/market/liquidations?interval=5m|15m|1h|4h|12h|1d&from=&to=&limit=300",
       "GET /v1/market/liquidations/recent?limit=50",
+      "GET /v1/market/liquidations/whales?wallet=&coin=&since=&minNtlUsd=&active=&limit=50",
+      "GET /v1/perps/volume?bars=3&sort=rvol|volume&limit=50&minBarUsd=0",
+      "GET /v1/perps/:coin/volume?interval=1m|5m|1h&from=&to=&limit=300",
+      "GET /v1/signals?coin=&status=open|confirmed|expired&since=&marketWide=&limit=100",
       "GET /v1/alerts?coin=&window=&side=long|short|total&since=&limit=100",
       "GET /v1/alerts/rules",
       "GET /v1/whales/new?window=1h&minUsd=1000000&positioned=true|false&newOnly=false&limit=100",
       "GET /v1/bridge/deposits?window=24h&minUsd=100000&limit=100",
     ],
   }));
+
+  // Volume board: every coin's relative volume over the last N 5m bars against
+  // its own baseline, with the flatness/positioning numbers the detector uses —
+  // "who is trading abnormally right now", sorted by rvol.
+  app.get("/v1/perps/volume", async (req, reply) => {
+    const q = req.query as Query;
+    const bars = parseLimit(q.bars, 3, 12);
+    if (bars === null) return bad(reply, "invalid bars — use 1..12 (5m bars)");
+    const limit = parseLimit(q.limit, 50, 500);
+    if (limit === null) return bad(reply, "invalid limit");
+    const sortRaw = q.sort ?? "rvol";
+    if (sortRaw !== "rvol" && sortRaw !== "volume") return bad(reply, `invalid sort "${sortRaw}" — use rvol|volume`);
+    let minBarUsd = 0;
+    if (q.minBarUsd !== undefined && q.minBarUsd !== "") {
+      minBarUsd = Number(q.minBarUsd);
+      if (!Number.isFinite(minBarUsd) || minBarUsd < 0) return bad(reply, "invalid minBarUsd");
+    }
+    const rows = await cached(`vol:board:${bars}`, 30_000, async () => {
+      const nowMs = Date.now();
+      const w = windowBuckets(bars, nowMs);
+      const [ctx, oiStart, oiNow] = await Promise.all([volumeContext(null, bars, nowMs), oiUsdAt(null, w.startMs), oiUsdAt(null, nowMs)]);
+      const out: Array<Record<string, unknown> & { rvol: number | null; volNtlUsd: number; avgBarUsd: number }> = [];
+      for (const [coin, c] of ctx) {
+        const m = volumeMetrics(c, oiStart.get(coin) ?? null, oiNow.get(coin) ?? null, nowMs);
+        if (!m) continue;
+        out.push({
+          coin,
+          rvol: m.rvol,
+          minBarRvol: m.minBarRvol,
+          volNtlUsd: m.volNtl,
+          expectedNtlUsd: m.expectedNtl,
+          avgBarUsd: m.avgBarUsd,
+          bars: m.bars,
+          from: new Date(m.tFromMs).toISOString(),
+          pxMovePct: m.moveP,
+          atrPct: m.atrPct,
+          moveAtr: m.moveAtr,
+          buySharePct: m.buySharePct,
+          twapSharePct: m.twapSharePct,
+          oiChangePct: m.oiChangePct,
+          historyHours: Math.round(m.historyHours * 10) / 10,
+        });
+      }
+      return { asOf: new Date(nowMs).toISOString(), windowFrom: new Date(w.startMs).toISOString(), out };
+    });
+    const ranked = rows.out
+      .filter((r) => r.avgBarUsd >= minBarUsd)
+      .sort((a, b) => (sortRaw === "rvol" ? (b.rvol ?? -1) - (a.rvol ?? -1) : b.volNtlUsd - a.volNtlUsd) || a.coin!.toString().localeCompare(b.coin!.toString()))
+      .slice(0, limit);
+    return { asOf: rows.asOf, bars, windowFrom: rows.windowFrom, count: ranked.length, data: ranked };
+  });
+
+  // Per-coin volume bars from the trade tape (buy/sell split, TWAP share, VWAP).
+  app.get("/v1/perps/:coin/volume", async (req, reply) => {
+    const { coin } = req.params as { coin: string };
+    const asset = await resolveCoin(coin);
+    if (!asset) return notFound(reply, `unknown coin "${coin}"`);
+    const q = req.query as Query;
+    const interval = q.interval ?? "5m";
+    const spec = VOL_TABLES[interval];
+    if (!spec) return bad(reply, `invalid interval "${interval}" — use ${Object.keys(VOL_TABLES).join(", ")}`);
+    const limit = parseLimit(q.limit, 300, CANDLE_LIMIT_MAX);
+    if (limit === null) return bad(reply, "invalid limit");
+    const from = parseTimeMs(q.from);
+    const to = parseTimeMs(q.to);
+    if (from === null || to === null) return bad(reply, "invalid from/to — use epoch ms, epoch seconds, or an ISO timestamp");
+    const toMs = to ?? Date.now() + spec.ms;
+    const fromMs = from ?? toMs - limit * spec.ms;
+    if (fromMs >= toMs) return bad(reply, "from must be before to");
+    const rows = await volCandles(asset.coin, spec.table, fromMs, toMs, limit);
+    return { coin: asset.coin, interval, count: rows.length, data: rows.map(serializeVolBar) };
+  });
+
+  // Volume-leading-price signals fired by the collector, newest first.
+  app.get("/v1/signals", async (req, reply) => {
+    const q = req.query as Query;
+    const limit = parseLimit(q.limit, 100, 1000);
+    if (limit === null) return bad(reply, "invalid limit");
+    const since = parseTimeMs(q.since);
+    if (since === null) return bad(reply, "invalid since — use epoch ms, epoch seconds, or an ISO timestamp");
+    if (q.status !== undefined && q.status !== "" && !["open", "confirmed", "expired"].includes(q.status)) {
+      return bad(reply, `invalid status "${q.status}" — use open|confirmed|expired`);
+    }
+    let marketWide: boolean | undefined;
+    if (q.marketWide !== undefined && q.marketWide !== "") {
+      if (q.marketWide !== "true" && q.marketWide !== "false") return bad(reply, 'marketWide must be "true" or "false"');
+      marketWide = q.marketWide === "true";
+    }
+    let coin: string | undefined;
+    if (q.coin !== undefined && q.coin !== "") {
+      const asset = await resolveCoin(q.coin);
+      coin = asset ? asset.coin : q.coin;
+    }
+    const rows = await listVolSignals({
+      ...(coin !== undefined ? { coin } : {}),
+      ...(q.status ? { status: q.status } : {}),
+      ...(since !== undefined ? { sinceMs: since } : {}),
+      ...(marketWide !== undefined ? { marketWide } : {}),
+      limit,
+    });
+    return { count: rows.length, data: rows.map(serializeVolSignal) };
+  });
 
   // Liquidation threshold alerts fired by the collector (see LIQ_ALERT_RULES),
   // newest first. Every alert is one threshold crossing of one rule.
@@ -1084,6 +1268,45 @@ export function registerRoutes(app: FastifyInstance): void {
     if (!range) return reply;
     const rows = await liqCandles(null, range.bucketMs, range.fromMs, range.toMs, range.limit);
     return { interval: range.interval, count: rows.length, data: rows.map(serializeLiqCandle) };
+  });
+
+  // Large liquidated accounts: every wallet whose liquidation burst crossed
+  // LIQ_WHALE_THRESHOLD, with the per-coin breakdown. Newest first.
+  app.get("/v1/market/liquidations/whales", async (req, reply) => {
+    const q = req.query as Query;
+    const limit = parseLimit(q.limit, 50, 500);
+    if (limit === null) return bad(reply, "invalid limit");
+    const since = parseTimeMs(q.since);
+    if (since === null) return bad(reply, "invalid since — use epoch ms, epoch seconds, or an ISO timestamp");
+    let minNtlUsd: number | undefined;
+    if (q.minNtlUsd !== undefined && q.minNtlUsd !== "") {
+      minNtlUsd = Number(q.minNtlUsd);
+      if (!Number.isFinite(minNtlUsd) || minNtlUsd < 0) return bad(reply, "invalid minNtlUsd");
+    }
+    let active: boolean | undefined;
+    if (q.active !== undefined && q.active !== "") {
+      if (q.active !== "true" && q.active !== "false") return bad(reply, 'active must be "true" or "false"');
+      active = q.active === "true";
+    }
+    let wallet: string | undefined;
+    if (q.wallet !== undefined && q.wallet !== "") {
+      if (!/^0x[0-9a-fA-F]{40}$/.test(q.wallet)) return bad(reply, "invalid wallet — expected a 0x-prefixed 40-hex address");
+      wallet = q.wallet.toLowerCase();
+    }
+    let coin: string | undefined;
+    if (q.coin !== undefined && q.coin !== "") {
+      const asset = await resolveCoin(q.coin);
+      coin = asset ? asset.coin : q.coin;
+    }
+    const rows = await listLiqWhales({
+      ...(wallet !== undefined ? { wallet } : {}),
+      ...(coin !== undefined ? { coin } : {}),
+      ...(since !== undefined ? { sinceMs: since } : {}),
+      ...(minNtlUsd !== undefined ? { minNtlUsd } : {}),
+      ...(active !== undefined ? { active } : {}),
+      limit,
+    });
+    return { count: rows.length, data: rows.map(serializeLiqWhale) };
   });
 
   app.get("/v1/market/liquidations/recent", async (req, reply) => {

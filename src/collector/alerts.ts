@@ -4,6 +4,7 @@ import { opsEvent } from "../db/ops.js";
 import { pool } from "../db/pool.js";
 import { sleep } from "../hl/client.js";
 import { log, logErr } from "../log.js";
+import { formatUsd, sendWebhook, webhookConfigured, webhookFormat } from "./webhook.js";
 
 // Liquidation threshold alerts.
 //
@@ -25,9 +26,6 @@ import { log, logErr } from "../log.js";
 // after they print, and backfills after downtime) simply raise the window value
 // on a later evaluation — nothing here depends on fills arriving in order.
 
-const WEBHOOK_TIMEOUT_MS = 10_000;
-const WEBHOOK_ATTEMPTS = 3;
-
 interface RuleState {
   active: boolean;
 }
@@ -40,14 +38,6 @@ interface FiredAlert {
   fills: number;
   totals: LiqWindowTotals;
   message: string;
-}
-
-export function formatUsd(n: number): string {
-  const abs = Math.abs(n);
-  if (abs >= 1e9) return `$${(n / 1e9).toFixed(2)}B`;
-  if (abs >= 1e6) return `$${(n / 1e6).toFixed(2)}M`;
-  if (abs >= 1e3) return `$${(n / 1e3).toFixed(1)}k`;
-  return `$${n.toFixed(0)}`;
 }
 
 function sideLabel(rule: LiqAlertRule): string {
@@ -192,10 +182,10 @@ export function startLiqAlerts(isStopped: () => boolean): () => Promise<void> {
             a.totals.longEvents,
             a.totals.shortEvents,
             a.message,
-            config.liqAlertWebhookUrl ? false : null,
+            webhookConfigured() ? false : null,
           ],
         );
-        if (config.liqAlertWebhookUrl && rows[0]) deliveries.push({ id: rows[0].id, alert: a });
+        if (webhookConfigured() && rows[0]) deliveries.push({ id: rows[0].id, alert: a });
       }
       await client.query("commit");
       // Delivery runs after commit, off the evaluation path; the row records the outcome.
@@ -208,56 +198,16 @@ export function startLiqAlerts(isStopped: () => boolean): () => Promise<void> {
     }
   }
 
-  function webhookFormat(): "json" | "discord" | "slack" {
-    if (config.liqAlertWebhookFormat !== "auto") return config.liqAlertWebhookFormat;
-    try {
-      const host = new URL(config.liqAlertWebhookUrl).hostname.toLowerCase();
-      if (/(^|\.)discord(app)?\.com$/.test(host)) return "discord";
-      if (/(^|\.)slack\.com$/.test(host)) return "slack";
-    } catch {
-      /* fall through */
-    }
-    return "json";
-  }
-
-  function webhookBody(id: string, a: FiredAlert): Record<string, unknown> {
-    const fmt = webhookFormat();
-    const text = `🚨 ${a.message}`;
-    if (fmt === "discord") return { content: text };
-    if (fmt === "slack") return { text };
-    return { type: "liquidation_threshold", alert: serializeAlert(id, a) };
-  }
-
   async function deliver(id: string, a: FiredAlert): Promise<void> {
-    const body = JSON.stringify(webhookBody(id, a));
-    let lastErr = "";
-    for (let attempt = 0; attempt < WEBHOOK_ATTEMPTS; attempt++) {
-      if (attempt > 0) await sleep(1_000 * 2 ** (attempt - 1));
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT_MS);
-      try {
-        const res = await fetch(config.liqAlertWebhookUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body,
-          signal: controller.signal,
-        });
-        if (res.ok) {
-          await pool.query("update liq_alerts set delivered = true, delivery_error = null where id = $1", [id]).catch(() => undefined);
-          return;
-        }
-        lastErr = `HTTP ${res.status} ${(await res.text().catch(() => "")).slice(0, 200)}`.trim();
-        if (res.status >= 400 && res.status < 500 && res.status !== 429) break; // not retryable
-      } catch (err) {
-        lastErr = err instanceof Error ? (err.name === "AbortError" ? "timeout" : err.message) : String(err);
-      } finally {
-        clearTimeout(timer);
-      }
+    const r = await sendWebhook(`🚨 ${a.message}`, { type: "liquidation_threshold", alert: serializeAlert(id, a) });
+    if (r.ok) {
+      await pool.query("update liq_alerts set delivered = true, delivery_error = null where id = $1", [id]).catch(() => undefined);
+      return;
     }
-    logErr("alerts", `webhook delivery failed for alert #${id}`, lastErr);
-    await opsEvent("alerts", "error", `webhook delivery failed for alert #${id}: ${lastErr}`);
+    logErr("alerts", `webhook delivery failed for alert #${id}`, r.error);
+    await opsEvent("alerts", "error", `webhook delivery failed for alert #${id}: ${r.error}`);
     await pool
-      .query("update liq_alerts set delivered = false, delivery_error = $2 where id = $1", [id, lastErr.slice(0, 500)])
+      .query("update liq_alerts set delivered = false, delivery_error = $2 where id = $1", [id, r.error])
       .catch(() => undefined);
   }
 
@@ -295,7 +245,7 @@ export function startLiqAlerts(isStopped: () => boolean): () => Promise<void> {
     `liquidation alerts started: ${rules.length} rules over ${new Set(rules.map((r) => r.coin)).size} coin(s) ` +
       `(${rules.map((r) => `${r.coin} ${r.window} ${r.side} ≥ ${formatUsd(r.thresholdUsd)}`).join(", ")}), ` +
       `every ${Math.round(config.liqAlertIntervalMs / 1000)}s, re-arm below ${config.liqAlertRearmPct}%, ` +
-      `webhook ${config.liqAlertWebhookUrl ? webhookFormat() : "off"}`,
+      `webhook ${webhookConfigured() ? webhookFormat() : "off"}`,
   );
 
   return async () => {
