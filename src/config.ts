@@ -55,7 +55,7 @@ export interface LiqAlertRule {
 export const LIQ_ALERT_DEFAULT_RULES =
   "BTC:15m:15M,BTC:1h:40M,BTC:24h:100M,ETH:15m:10M,ETH:1h:15M,ETH:24h:100M";
 
-function parseUsd(raw: string): number | null {
+export function parseUsd(raw: string): number | null {
   const m = /^\$?([\d_]*\.?\d+(?:e\d+)?)\s*([kmb])?$/i.exec(raw.trim());
   if (!m) return null;
   const n = Number(m[1]!.replace(/_/g, ""));
@@ -64,12 +64,29 @@ function parseUsd(raw: string): number | null {
   return n * mult;
 }
 
-function parseWindowMs(raw: string): number | null {
+export function parseWindowMs(raw: string): number | null {
   const m = /^(\d{1,3})(m|h|d)$/.exec(raw.trim());
   if (!m) return null;
   const n = parseInt(m[1]!, 10);
   if (n === 0) return null;
   return n * (m[2] === "m" ? 60_000 : m[2] === "h" ? 3_600_000 : 86_400_000);
+}
+
+function usdEnv(name: string, def: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return def;
+  if (/^0+(\.0+)?$/.test(raw.trim())) return 0;
+  const v = parseUsd(raw);
+  if (v === null) throw new Error(`env ${name} must be a USD amount like 10M, 500k or 10000000, got "${raw}"`);
+  return v;
+}
+
+function windowEnv(name: string, def: string): { name: string; ms: number } {
+  const raw = process.env[name];
+  const src = raw === undefined || raw.trim() === "" ? def : raw.trim();
+  const ms = parseWindowMs(src);
+  if (ms === null) throw new Error(`env ${name} must be a window like 15m, 1h or 24h, got "${raw}"`);
+  return { name: src, ms };
 }
 
 export function parseLiqAlertRules(raw: string): LiqAlertRule[] {
@@ -144,6 +161,13 @@ export const config = {
   liqAlertWebhookUrl: process.env.LIQ_ALERT_WEBHOOK_URL?.trim() ?? "",
   liqAlertWebhookFormat: (process.env.LIQ_ALERT_WEBHOOK_FORMAT ?? "auto") as "auto" | "json" | "discord" | "slack",
 
+  // Large liquidated accounts: collect any wallet whose liquidation burst
+  // (fills across all coins with no gap longer than the window) crosses the
+  // threshold. 0 disables.
+  liqWhaleThresholdUsd: usdEnv("LIQ_WHALE_THRESHOLD", 10_000_000),
+  liqWhaleWindow: windowEnv("LIQ_WHALE_WINDOW", "1h"),
+  liqWhaleNotify: process.env.LIQ_WHALE_NOTIFY !== "false",
+
   // Moving-average tracker (EMAs per coin per timeframe, from HL's official candles).
   emasEnabled: process.env.EMAS_ENABLED !== "false",
   emaTimeframes: listEnv("EMA_TIMEFRAMES", "1h,4h,12h,1d").sort(
@@ -197,6 +221,11 @@ export function assertConfig(): void {
         if (r.windowMs > config.liqRetentionDays * 86_400_000) {
           throw new Error(`LIQ_ALERT_RULES: window "${r.window}" for ${r.coin} exceeds LIQ_RETENTION_DAYS (${config.liqRetentionDays}d)`);
         }
+      }
+    }
+    if (config.liqWhaleThresholdUsd > 0) {
+      if (config.liqWhaleWindow.ms < 60_000 || config.liqWhaleWindow.ms > 86_400_000) {
+        throw new Error("LIQ_WHALE_WINDOW must be between 1m and 24h");
       }
     }
   }

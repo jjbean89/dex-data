@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { EMA_TF_MS, config, type LiqAlertSide } from "../config.js";
 import { liqWindowTotals, listLiqAlerts, loadLiqAlertRules, sideSlice, type LiqAlertRow, type LiqAlertRuleRow } from "../db/liq-alerts.js";
+import { listLiqWhales, type LiqWhaleRow } from "../db/liq-whales.js";
 import { pool } from "../db/pool.js";
 import {
   LATEST_MAX_AGE_MS,
@@ -245,6 +246,27 @@ function serializeLiqFill(r: LiqFillRow, includeCoin: boolean): Record<string, u
   };
 }
 
+function serializeWhale(r: LiqWhaleRow): Record<string, unknown> {
+  return {
+    id: r.id,
+    wallet: r.wallet,
+    explorer: `https://app.hyperliquid.xyz/explorer/address/${r.wallet}`,
+    detectedAt: r.detected_at.toISOString(),
+    from: r.from_ts.toISOString(),
+    to: r.to_ts.toISOString(),
+    toMs: r.to_ts.getTime(),
+    durationSec: Math.round((r.to_ts.getTime() - r.from_ts.getTime()) / 1000),
+    ntlUsd: r.ntl,
+    thresholdUsd: r.threshold_usd,
+    events: r.events,
+    fills: r.fills,
+    coins: r.coins.map((c) => ({ coin: c.coin, side: c.side, ntlUsd: c.ntl, events: c.events, fills: c.fills })),
+    active: r.active,
+    delivered: r.delivered,
+    deliveryError: r.delivery_error,
+  };
+}
+
 function parseAlertSide(raw: string | undefined): LiqAlertSide | undefined | null {
   if (raw === undefined || raw === "") return undefined;
   return raw === "long" || raw === "short" || raw === "total" ? raw : null;
@@ -443,6 +465,7 @@ export function registerRoutes(app: FastifyInstance): void {
       "GET /v1/market/funding?interval=1h&smooth=8h&from=&to=&limit=300",
       "GET /v1/market/liquidations?interval=5m|15m|1h|4h|12h|1d&from=&to=&limit=300",
       "GET /v1/market/liquidations/recent?limit=50",
+      "GET /v1/market/liquidations/whales?wallet=&coin=&since=&minNtlUsd=&active=&limit=50",
       "GET /v1/alerts?coin=&window=&side=long|short|total&since=&limit=100",
       "GET /v1/alerts/rules",
     ],
@@ -1010,6 +1033,45 @@ export function registerRoutes(app: FastifyInstance): void {
     if (!range) return reply;
     const rows = await liqCandles(null, range.bucketMs, range.fromMs, range.toMs, range.limit);
     return { interval: range.interval, count: rows.length, data: rows.map(serializeLiqCandle) };
+  });
+
+  // Large liquidated accounts: every wallet whose liquidation burst crossed
+  // LIQ_WHALE_THRESHOLD, with the per-coin breakdown. Newest first.
+  app.get("/v1/market/liquidations/whales", async (req, reply) => {
+    const q = req.query as Query;
+    const limit = parseLimit(q.limit, 50, 500);
+    if (limit === null) return bad(reply, "invalid limit");
+    const since = parseTimeMs(q.since);
+    if (since === null) return bad(reply, "invalid since — use epoch ms, epoch seconds, or an ISO timestamp");
+    let minNtlUsd: number | undefined;
+    if (q.minNtlUsd !== undefined && q.minNtlUsd !== "") {
+      minNtlUsd = Number(q.minNtlUsd);
+      if (!Number.isFinite(minNtlUsd) || minNtlUsd < 0) return bad(reply, "invalid minNtlUsd");
+    }
+    let active: boolean | undefined;
+    if (q.active !== undefined && q.active !== "") {
+      if (q.active !== "true" && q.active !== "false") return bad(reply, 'active must be "true" or "false"');
+      active = q.active === "true";
+    }
+    let wallet: string | undefined;
+    if (q.wallet !== undefined && q.wallet !== "") {
+      if (!/^0x[0-9a-fA-F]{40}$/.test(q.wallet)) return bad(reply, "invalid wallet — expected a 0x-prefixed 40-hex address");
+      wallet = q.wallet.toLowerCase();
+    }
+    let coin: string | undefined;
+    if (q.coin !== undefined && q.coin !== "") {
+      const asset = await resolveCoin(q.coin);
+      coin = asset ? asset.coin : q.coin;
+    }
+    const rows = await listLiqWhales({
+      ...(wallet !== undefined ? { wallet } : {}),
+      ...(coin !== undefined ? { coin } : {}),
+      ...(since !== undefined ? { sinceMs: since } : {}),
+      ...(minNtlUsd !== undefined ? { minNtlUsd } : {}),
+      ...(active !== undefined ? { active } : {}),
+      limit,
+    });
+    return { count: rows.length, data: rows.map(serializeWhale) };
   });
 
   app.get("/v1/market/liquidations/recent", async (req, reply) => {

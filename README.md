@@ -9,6 +9,7 @@ Custom Hyperliquid market data service. Hyperliquid's public API only exposes th
 - **Long/short trader counts** — how many wallets are long vs. short each coin, with change over time (derived from the public trade tape + per-wallet position tracking; this exists in no API anywhere)
 - **Liquidations** — per-coin and venue-wide liquidation histograms (long vs. short notional, event counts) on any timeframe, trailing-window totals ("how much got liquidated in the last hour/day"), and a raw liquidation feed with wallets — reconstructed from public data; Hyperliquid publishes no liquidation feed at all
 - **Liquidation alerts** — threshold rules per coin × trailing window (15m / 1h / 24h) × side; one alert per crossing, persisted and queryable, optionally pushed to a webhook (Discord/Slack/JSON)
+- **Large liquidated accounts** — every wallet liquidated for more than a threshold ($10M by default) in one burst, with the per-coin breakdown, collected as it happens
 - **EMAs for every coin on every timeframe** — EMA 21/200 on 1h/4h/12h/1d (all configurable), seeded from full candle history to match TradingView, plus the screener columns derived from them (price-vs-EMA %, EMA-vs-EMA cross spread) in one response
 
 One process polls `metaAndAssetCtxs` (every live perp in a single request) every 15s, rolls ticks up into 5m/1h candles, prunes raw data on a retention schedule, and runs the trades-WebSocket position tracker. A second process serves a read-only JSON API.
@@ -92,7 +93,10 @@ Deploys are zero-drama: the collector shuts down gracefully on SIGTERM and the D
 | `LIQ_ALERT_RULES` | `BTC:15m:15M,BTC:1h:40M,BTC:24h:100M,ETH:15m:10M,ETH:1h:15M,ETH:24h:100M` | `COIN:WINDOW:THRESHOLD[:SIDES]` list; sides `long`/`short`/`total`/`both` (default `both` = longs and shorts alerted separately) |
 | `LIQ_ALERT_INTERVAL_MS` | `30000` | Rule evaluation cadence |
 | `LIQ_ALERT_REARM_PCT` | `80` | A fired rule re-arms once its window value drops below this % of the threshold |
-| `LIQ_ALERT_WEBHOOK_URL` / `LIQ_ALERT_WEBHOOK_FORMAT` | — / `auto` | Optional push target; format `auto` picks `discord`/`slack` from the host, else raw `json` |
+| `LIQ_ALERT_WEBHOOK_URL` / `LIQ_ALERT_WEBHOOK_FORMAT` | — / `auto` | Optional push target for alerts and whale liquidations; format `auto` picks `discord`/`slack` from the host, else raw `json` |
+| `LIQ_WHALE_THRESHOLD` | `10M` | Collect any wallet liquidated for at least this much (USD) in one burst; `0` disables |
+| `LIQ_WHALE_WINDOW` | `1h` | Max gap between a wallet's liquidation fills for them to count as one burst |
+| `LIQ_WHALE_NOTIFY` | `true` | Also push whale liquidations to the webhook |
 | `HYPERTRACKER_API_KEY` | — | Enables the one-time starting-census import (see positioning docs below) |
 | `HYPERTRACKER_BASE_URL` / `HYPERTRACKER_REQ_DELAY_MS` | `https://ht-api.coinmarketman.com/api` / `1500` | Census source + pacing |
 | `PG_SSL_NO_VERIFY` | `false` | Accept self-signed Postgres TLS (Railway public proxy) |
@@ -236,8 +240,27 @@ Semantics:
 - **Edge-triggered with hysteresis.** A rule fires once when its window value crosses the threshold, then stays `active` until the value drops below `LIQ_ALERT_REARM_PCT`% of the threshold (fills aging out of the trailing window). A cascade produces one alert per rule, not one per evaluation, and a value hovering around the threshold doesn't flap. Once re-armed, a fresh crossing fires again.
 - **State survives restarts** (`liq_alert_rules`): an alert already sent is not re-sent after a redeploy, and a crossing that happened during downtime fires on boot with the current value.
 - **Values are the recorder's floors.** Liquidations are classified a few seconds to minutes after they print (and backfilled after downtime), so the window value can keep climbing after an alert; the alert carries the value at detection time. See the liquidation recorder's coverage notes above.
-- **Delivery.** Every alert is logged (`[alerts] ALERT …`), stored, and — with `LIQ_ALERT_WEBHOOK_URL` set — POSTed as JSON. Discord and Slack incoming-webhook URLs are auto-detected and receive a one-line message (`content` / `text`); anything else gets `{ "type": "liquidation_threshold", "alert": { …same shape as /v1/alerts… } }`. Three attempts with backoff; the outcome lands in `delivered` / `deliveryError` on the row and failures are also written to `ops_events`.
+- **Delivery.** Every alert is logged (`[alerts] ALERT …`), stored, and — with `LIQ_ALERT_WEBHOOK_URL` set — POSTed as JSON. Discord and Slack incoming-webhook URLs are auto-detected and receive a one-line message (`content` / `text`); anything else gets `{ "type": "liquidation_threshold", "alert": { …same shape as /v1/alerts… } }` (whale liquidations arrive on the same webhook as `{ "type": "whale_liquidation", "whale": { … } }`). Three attempts with backoff; the outcome lands in `delivered` / `deliveryError` on the row and failures are also written to `ops_events`.
 - Rule changes take effect on the next collector boot. Coin names are Hyperliquid's exact spelling (`BTC`, `ETH`, `kPEPE`); an unknown coin is logged as a warning rather than silently never firing.
+
+### `GET /v1/market/liquidations/whales`
+**Large liquidated accounts.** Every wallet whose liquidations in one burst add up to at least `LIQ_WHALE_THRESHOLD` ($10M by default), newest first, with what got liquidated. A burst is one wallet's liquidation fills, across all coins, with no gap longer than `LIQ_WHALE_WINDOW` — so a position taken down in several partial liquidations over a few minutes is one record, and a wallet liquidated on BTC and ETH in the same cascade is one record with both. Params: `wallet`, `coin`, `since`, `minNtlUsd`, `active` (`true` = burst still going), `limit` (default 50, max 500).
+
+```json
+{ "count": 1,
+  "data": [{ "id": "7", "wallet": "0x…", "explorer": "https://app.hyperliquid.xyz/explorer/address/0x…",
+             "detectedAt": "2026-09-02T15:20:41.002Z", "from": "2026-09-02T15:18:02.113Z", "to": "2026-09-02T15:20:19.870Z",
+             "toMs": 1788362419870, "durationSec": 138,
+             "ntlUsd": 13000000, "thresholdUsd": 10000000, "events": 3, "fills": 9,
+             "coins": [{ "coin": "BTC", "side": "long", "ntlUsd": 6000000, "events": 1, "fills": 4 },
+                       { "coin": "ETH", "side": "long", "ntlUsd": 7000000, "events": 2, "fills": 5 }],
+             "active": false, "delivered": true, "deliveryError": null }] }
+```
+
+Semantics:
+- **Records grow while the burst is open.** A wallet is recorded the moment its burst crosses the threshold (and pushed to the webhook once, as `🐋 …`); further liquidations within the window fold into the same record (`ntlUsd`, `events`, `coins`, `to` update) until the window passes with no new fills, then it freezes. Later liquidations of the same wallet start a new record.
+- **Late discovery still counts.** The tracker keys on when fills were recorded, not when they traded, so liquidations the recorder classifies late or backfills after downtime are collected too (a burst older than the window is recorded already closed).
+- Wallets are public on-chain addresses; `explorer` links to Hyperliquid's own explorer. Totals are the recorder's floors (see coverage notes above) — a large liquidation is exactly the flow the verification queue prioritises, so these are caught reliably in practice.
 
 ### `GET /health`
 `{ok, lastTickAt, tickAgeSec, ticksStale, liveCoins}` — wire this to Railway's healthcheck.
