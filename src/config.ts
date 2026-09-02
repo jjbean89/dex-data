@@ -226,6 +226,8 @@ export const config = {
   whalePositionMinUsd: numEnv("WHALE_POSITION_MIN_USD", 1_000_000),
   // Whale alerts go to the same webhook as the liquidation alerts (LIQ_ALERT_WEBHOOK_URL).
   whaleAlertEvents: listEnv("WHALE_ALERT_EVENTS", "funded,positioned"),
+  // 'funded' alerts only for fresh wallets: first-ever Hyperliquid ledger entry within this many hours.
+  whaleFundedMaxAgeHours: numEnv("WHALE_FUNDED_MAX_AGE_HOURS", 24),
 
   pgSslNoVerify: process.env.PG_SSL_NO_VERIFY === "true",
 };
@@ -319,6 +321,7 @@ export function assertConfig(): void {
     if (config.whaleWatchPollMs < 10_000) throw new Error("WHALE_WATCH_POLL_MS below 10000ms would burn clearinghouseState budget");
     if (!(config.whalePositionMinUsd >= 0)) throw new Error("WHALE_POSITION_MIN_USD must be zero or positive");
     if (config.bridgeRetentionDays < 1) throw new Error("BRIDGE_RETENTION_DAYS must be at least 1");
+    if (config.whaleFundedMaxAgeHours <= 0) throw new Error("WHALE_FUNDED_MAX_AGE_HOURS must be positive");
     for (const e of config.whaleAlertEvents) {
       if (e !== "funded" && e !== "positioned") {
         throw new Error(`WHALE_ALERT_EVENTS: "${e}" is not an event — use any of funded, positioned`);

@@ -109,13 +109,17 @@ function ago(d: Date): string {
   return `${Math.round(h / 24)}d ago`;
 }
 
+// "New" = the wallet's first-ever Hyperliquid ledger entry is within
+// WHALE_FUNDED_MAX_AGE_HOURS; an empty ledger (deposit not yet indexed) counts as new.
 function accountAge(ledgerFirst: Date | null, checked: boolean): { isNew: boolean | null; label: string } {
   if (!checked) return { isNew: null, label: "account age unknown" };
   if (!ledgerFirst) return { isNew: true, label: "brand-new account" };
-  const days = (Date.now() - ledgerFirst.getTime()) / 86_400_000;
-  if (days < 1) return { isNew: true, label: `brand-new account (first activity ${ago(ledgerFirst)})` };
-  if (days < 30) return { isNew: false, label: `account ${Math.round(days)}d old` };
-  return { isNew: false, label: `account ${Math.round(days / 30)}mo old` };
+  const ageMs = Date.now() - ledgerFirst.getTime();
+  const isNew = ageMs <= config.whaleFundedMaxAgeHours * 3_600_000;
+  const days = ageMs / 86_400_000;
+  if (isNew) return { isNew, label: `brand-new account (first activity ${ago(ledgerFirst)})` };
+  if (days < 30) return { isNew, label: `account ${Math.round(days)}d old` };
+  return { isNew, label: `account ${Math.round(days / 30)}mo old` };
 }
 
 export function startWhaleTracker(isStopped: () => boolean, tape: TradeTape | null): () => Promise<void> {
@@ -378,8 +382,15 @@ export function startWhaleTracker(isStopped: () => boolean, tape: TradeTape | nu
     const ledgerKnown = ledgerChecked || w.ledger_checked_at !== null;
     const ledgerFirstAt = ledgerChecked ? ledgerFirst : w.ledger_first_at;
     const age = accountAge(ledgerFirstAt, ledgerKnown);
-    if (w.funded_alerted_at === null) {
-      if (alertKinds.has("funded")) await fireAlert("funded", w, state, age.isNew, ledgerFirstAt, [], fundedMessage(w, state, age.label));
+    // The funded alert is for fresh wallets only, so it waits for the ledger check
+    // (a failed check leaves the marker unset and the next pass retries) and is
+    // skipped — once, silently to the webhook — for accounts older than the cutoff.
+    if (w.funded_alerted_at === null && ledgerKnown) {
+      if (age.isNew) {
+        if (alertKinds.has("funded")) await fireAlert("funded", w, state, age.isNew, ledgerFirstAt, [], fundedMessage(w, state, age.label));
+      } else {
+        log("whales", `funded alert skipped for ${w.address}: ${age.label} (cutoff ${config.whaleFundedMaxAgeHours}h)`);
+      }
       await pool.query("update whale_wallets set funded_alerted_at = now() where address = $1", [w.address]);
     }
     if (baseline && opened.length > 0 && openedNtl >= config.whalePositionMinUsd && w.position_alerted_at === null) {
