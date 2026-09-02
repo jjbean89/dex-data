@@ -1,5 +1,5 @@
 import { config } from "../config.js";
-import type { Candle, ClearinghouseState, FundingHistoryEntry, MetaAndAssetCtxs, UserFill } from "./types.js";
+import type { Candle, ClearinghouseState, FundingHistoryEntry, LedgerUpdate, MetaAndAssetCtxs, UserFill } from "./types.js";
 
 const MAX_RETRIES = 3;
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -60,6 +60,15 @@ export const hl = {
   userFillsByTime: (user: string, startTime: number, endTime?: number) =>
     info<UserFill[]>({
       type: "userFillsByTime",
+      user,
+      startTime,
+      ...(endTime !== undefined ? { endTime } : {}),
+    }),
+
+  // A wallet's deposits/withdrawals/transfers from startTime, oldest first (weight 20).
+  userNonFundingLedgerUpdates: (user: string, startTime: number, endTime?: number) =>
+    info<LedgerUpdate[]>({
+      type: "userNonFundingLedgerUpdates",
       user,
       startTime,
       ...(endTime !== undefined ? { endTime } : {}),
