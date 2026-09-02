@@ -26,6 +26,7 @@ export async function pruneOldData(): Promise<{ ticks: number; candles5m: number
   await pool.query("delete from whale_wallets where flagged_at < now() - make_interval(days => $1)", [
     config.bridgeRetentionDays,
   ]);
+  await pool.query("delete from whale_alerts where ts < now() - make_interval(days => $1)", [config.bridgeRetentionDays]);
   // Fully closed positions are dead weight: snapshots filter szi <> 0, and a later
   // fill simply re-inserts the row. Keep the ledger to open positions only.
   const p = await pool.query(

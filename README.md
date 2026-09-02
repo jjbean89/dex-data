@@ -13,7 +13,7 @@ Custom Hyperliquid market data service. Hyperliquid's public API only exposes th
 - **Volume bars for every coin** — per-bar notional from the public trade tape (1m/5m/1h), split by taker side with TWAP flow flagged; Hyperliquid only exposes a rolling 24h number, so like OI this exists only if you record it
 - **Volume-leading-price signals** — abnormal volume while price is still flat, confirmed by open-interest growth or one-sided taker flow: the accumulation that precedes a move, with breakout confirmation after the fact
 - **EMAs for every coin on every timeframe** — EMA 21/200 on 1h/4h/12h/1d (all configurable), seeded from full candle history to match TradingView, plus the screener columns derived from them (price-vs-EMA %, EMA-vs-EMA cross spread) in one response
-- **New whale wallets** — every wallet that bridged $1M+ (configurable) into Hyperliquid in the last hour, whether the account is brand new, and whether it has opened a position yet (with the positions) — from the Arbitrum bridge's deposit logs joined to per-wallet Hyperliquid state; Hyperliquid's own API has no deposit feed at all
+- **New whale wallets** — every wallet that bridged $1M+ (configurable) into Hyperliquid in the last hour, whether the account is brand new, and whether it has opened a position yet (with the positions) — from the Arbitrum bridge's deposit logs joined to per-wallet Hyperliquid state; Hyperliquid's own API has no deposit feed at all. Each new whale, and its first position, can be pushed to Discord/Slack
 
 One process polls `metaAndAssetCtxs` (every live perp in a single request) every 15s, rolls ticks up into 5m/1h candles, prunes raw data on a retention schedule, runs the trades-WebSocket position tracker, and polls the Arbitrum bridge for incoming deposits. A second process serves a read-only JSON API.
 
@@ -96,7 +96,7 @@ Deploys are zero-drama: the collector shuts down gracefully on SIGTERM and the D
 | `LIQ_ALERT_RULES` | `BTC:15m:15M,BTC:1h:40M,BTC:24h:100M,ETH:15m:10M,ETH:1h:15M,ETH:24h:100M` | `COIN:WINDOW:THRESHOLD[:SIDES]` list; sides `long`/`short`/`total`/`both` (default `both` = longs and shorts alerted separately) |
 | `LIQ_ALERT_INTERVAL_MS` | `30000` | Rule evaluation cadence |
 | `LIQ_ALERT_REARM_PCT` | `80` | A fired rule re-arms once its window value drops below this % of the threshold |
-| `LIQ_ALERT_WEBHOOK_URL` / `LIQ_ALERT_WEBHOOK_FORMAT` | — / `auto` | Optional push target for alerts and whale liquidations; format `auto` picks `discord`/`slack` from the host, else raw `json` |
+| `LIQ_ALERT_WEBHOOK_URL` / `LIQ_ALERT_WEBHOOK_FORMAT` | — / `auto` | Optional push target for liquidation alerts, whale liquidations, volume signals, and bridge-whale alerts; format `auto` picks `discord`/`slack` from the host, else raw `json` |
 | `LIQ_WHALE_THRESHOLD` | `10M` | Collect any wallet liquidated for at least this much (USD) in one burst; `0` disables |
 | `LIQ_WHALE_WINDOW` | `1h` | Max gap between a wallet's liquidation fills for them to count as one burst |
 | `LIQ_WHALE_NOTIFY` | `true` | Also push whale liquidations to the webhook |
@@ -120,6 +120,7 @@ Deploys are zero-drama: the collector shuts down gracefully on SIGTERM and the D
 | `BRIDGE_BACKFILL_HOURS` / `BRIDGE_MIN_RECORD_USD` / `BRIDGE_RETENTION_DAYS` | `6` / `1000` / `90` | First-boot scan depth; smallest deposit recorded; raw deposit retention |
 | `WHALE_MIN_USD` / `WHALE_WINDOW_HOURS` | `1000000` / `1` | Flag a wallet when its deposits over the trailing window reach this |
 | `WHALE_WATCH_HOURS` / `WHALE_WATCH_POLL_MS` | `24` / `60000` | How long, and how often, a flagged wallet is polled on HL for its first position |
+| `WHALE_ALERT_EVENTS` | `funded,positioned` | Which whale events to push to `LIQ_ALERT_WEBHOOK_URL` (shared with the liquidation alerts) |
 | `HYPERTRACKER_API_KEY` | — | Enables the one-time starting-census import (see positioning docs below) |
 | `HYPERTRACKER_BASE_URL` / `HYPERTRACKER_REQ_DELAY_MS` | `https://ht-api.coinmarketman.com/api` / `1500` | Census source + pacing |
 | `PG_SSL_NO_VERIFY` | `false` | Accept self-signed Postgres TLS (Railway public proxy) |
@@ -347,6 +348,28 @@ How this works — Hyperliquid's API cannot answer this question by itself:
 - `positioned` filters on the **live** positions ledger (a wallet that opened and closed reads `false` with `positionedAt` set); the positions listed come from the same ledger the long/short tracker maintains, so they stay current from fills after the first check. `openNtlUsd` and `ntlUsd` are marked at the latest tick.
 - **What it misses, honestly:** money that never touches Arbitrum — transfers between Hyperliquid accounts, sub-account funding, HyperEVM→Core moves — and native-asset deposits through Hyperunit (those land as spot BTC/ETH/SOL, not USDC margin). A new wallet funded from an existing whale's Hyperliquid account is invisible here. A deposit routed through a contract that forwards funds could credit an address other than the transfer sender; the tracker records the sender.
 - Requests: the bridge watcher costs ~8 RPC calls per minute (head + logs per poll) plus one batched block lookup per poll that found deposits; whale polling is a handful of weight-2 calls per minute at most.
+
+### `GET /v1/whales/alerts?kind=funded|positioned`
+**Whale alerts** — the push feed behind the board. Two events per whale episode, each sent once (state survives restarts):
+
+- `funded` — a wallet crossed `WHALE_MIN_USD`. Sent right after the tracker's first Hyperliquid check, so it already says whether the account is brand new and what its perps account is worth.
+- `positioned` — a flagged wallet was first seen with an open position: the largest positions with side, notional and entry, total notional, and account value.
+
+Every alert is logged (`[whales] ALERT …`), stored, and — with `LIQ_ALERT_WEBHOOK_URL` set, the same webhook the liquidation alerts use — POSTed. Discord and Slack incoming-webhook URLs are auto-detected and receive a one-line message ending in the wallet's explorer link; anything else gets `{type: "whale_funded" | "whale_positioned", alert: {…}}` with the structured fields. Delivery is retried, and the stored row records `delivered` / `deliveryError`. `WHALE_ALERT_EVENTS` narrows which events are sent. Params: `kind`, `address`, `since` (epoch ms/s or ISO), `limit` (default 100, max 1000).
+
+```
+🐋 New whale funded: 0x9a3c…e41b bridged $2.50M into Hyperliquid in several deposits (latest 2 min ago) — brand-new account (first activity 4 min ago), perps account $2.50M. https://app.hyperliquid.xyz/explorer/address/0x9a3c…
+🐋 Whale opened a position: 0x9a3c…e41b long BTC $7.40M @ 77510 — $7.40M total notional, account $2.50M. Bridged $2.50M 9 min ago, brand-new account (first activity 11 min ago). https://app.hyperliquid.xyz/explorer/address/0x9a3c…
+```
+
+```json
+{ "webhook": true, "events": ["funded", "positioned"], "count": 1,
+  "data": [{ "id": "7", "t": "2026-09-02T15:11:10.204Z", "tMs": 1788361870204, "kind": "positioned", "address": "0x9a3c…e41b",
+             "depositedUsd": 2500000, "accountValueUsd": 2498120.4, "totalNtlPosUsd": 7400000.0,
+             "isNewAccount": true, "ledgerFirstAt": "2026-09-02T15:02:11.000Z",
+             "positions": [{ "coin": "BTC", "side": "long", "sz": 95.2, "entryPx": 77510.0 }],
+             "message": "Whale opened a position: …", "delivered": true, "deliveryError": null }] }
+```
 
 ### `GET /v1/bridge/deposits?window=24h&minUsd=100000`
 The raw deposit tape behind the whale board, newest first: `{t, address, usdc, txHash, logIndex, block}` for every recorded bridge deposit ≥ `minUsd` in the window (default `100000`; anything down to `BRIDGE_MIN_RECORD_USD` is available). Same `bridge` freshness block as above.
