@@ -8,6 +8,7 @@ Custom Hyperliquid market data service. Hyperliquid's public API only exposes th
 - **Venue-wide aggregates** — total OI candles and OI-weighted average funding, the "Aggregated Open Interest" / "Aggregated Funding Rate" style series
 - **Long/short trader counts** — how many wallets are long vs. short each coin, with change over time (derived from the public trade tape + per-wallet position tracking; this exists in no API anywhere)
 - **Liquidations** — per-coin and venue-wide liquidation histograms (long vs. short notional, event counts) on any timeframe, trailing-window totals ("how much got liquidated in the last hour/day"), and a raw liquidation feed with wallets — reconstructed from public data; Hyperliquid publishes no liquidation feed at all
+- **Liquidation alerts** — threshold rules per coin × trailing window (15m / 1h / 24h) × side; one alert per crossing, persisted and queryable, optionally pushed to a webhook (Discord/Slack/JSON)
 - **EMAs for every coin on every timeframe** — EMA 21/200 on 1h/4h/12h/1d (all configurable), seeded from full candle history to match TradingView, plus the screener columns derived from them (price-vs-EMA %, EMA-vs-EMA cross spread) in one response
 
 One process polls `metaAndAssetCtxs` (every live perp in a single request) every 15s, rolls ticks up into 5m/1h candles, prunes raw data on a retention schedule, and runs the trades-WebSocket position tracker. A second process serves a read-only JSON API.
@@ -87,6 +88,11 @@ Deploys are zero-drama: the collector shuts down gracefully on SIGTERM and the D
 | `LIQ_VERIFY_LAG_MS` / `LIQ_WALLET_COOLDOWN_MS` | `8000` / `60000` | Burst batching lag; per-wallet re-verify floor |
 | `LIQ_BACKFILL_HOURS` / `LIQ_BACKFILL_WALLETS` | `6` / `250` | Downtime heal: sweep recently-active wallets over the missed window |
 | `LIQ_RETENTION_DAYS` | `90` | Raw liquidation fill retention (candles follow the candle retentions) |
+| `LIQ_ALERTS_ENABLED` | `true` | Liquidation threshold alerts (see `/v1/alerts`; needs the recorder) |
+| `LIQ_ALERT_RULES` | `BTC:15m:15M,BTC:1h:40M,BTC:24h:100M,ETH:15m:10M,ETH:1h:15M,ETH:24h:100M` | `COIN:WINDOW:THRESHOLD[:SIDES]` list; sides `long`/`short`/`total`/`both` (default `both` = longs and shorts alerted separately) |
+| `LIQ_ALERT_INTERVAL_MS` | `30000` | Rule evaluation cadence |
+| `LIQ_ALERT_REARM_PCT` | `80` | A fired rule re-arms once its window value drops below this % of the threshold |
+| `LIQ_ALERT_WEBHOOK_URL` / `LIQ_ALERT_WEBHOOK_FORMAT` | — / `auto` | Optional push target; format `auto` picks `discord`/`slack` from the host, else raw `json` |
 | `HYPERTRACKER_API_KEY` | — | Enables the one-time starting-census import (see positioning docs below) |
 | `HYPERTRACKER_BASE_URL` / `HYPERTRACKER_REQ_DELAY_MS` | `https://ht-api.coinmarketman.com/api` / `1500` | Census source + pacing |
 | `PG_SSL_NO_VERIFY` | `false` | Accept self-signed Postgres TLS (Railway public proxy) |
@@ -201,6 +207,38 @@ How this works — and its honest semantics (Hyperliquid has **no** liquidation 
 - **Backstop liquidations** (liquidator-vault takeovers below ⅔ maintenance margin) don't print on the book; they're recorded when a swept wallet's fills reveal them, flagged `method: "backstop"`.
 - Idempotent by construction: fills are keyed by HL's trade id, and candle buckets are recomputed from raw fills in the same transaction, so re-discovery and late verification never double-count.
 
+### `GET /v1/alerts` · `GET /v1/alerts/rules`
+**Liquidation threshold alerts.** The collector evaluates every rule in `LIQ_ALERT_RULES` — a coin, a trailing window, a threshold in USD notional, and which side(s) — against the exact trailing-window totals from the raw liquidation fills (the same numbers `/v1/perps/liquidations` reports). Out of the box:
+
+| Coin | 15m | 1h | 24h |
+|---|---|---|---|
+| BTC | $15M | $40M | $100M |
+| ETH | $10M | $15M | $100M |
+
+Each threshold applies to **longs liquidated and shorts liquidated separately** (`both`, the default): "$15M of BTC longs liquidated in 15 minutes" and "$15M of BTC shorts liquidated in 15 minutes" are two rules with independent state. Append `:total` to a rule to alert on the combined number instead, or `:long` / `:short` for one side only. Thresholds take `k`/`M`/`B` suffixes; windows are anything from `1m` up to `LIQ_RETENTION_DAYS`.
+
+`GET /v1/alerts` is the alert history, newest first. Params: `coin`, `window`, `side` (`long|short|total`), `since` (epoch ms/s or ISO), `limit` (default 100, max 1000).
+
+```json
+{ "count": 1,
+  "data": [{ "id": "42", "t": "2026-09-02T14:53:13.167Z", "tMs": 1788360793167,
+             "coin": "BTC", "window": "15m", "side": "long",
+             "ntlUsd": 16000000, "thresholdUsd": 15000000, "pctOfThreshold": 106.67,
+             "events": 8, "fills": 8,
+             "longs": { "ntlUsd": 16000000, "events": 8 }, "shorts": { "ntlUsd": 0, "events": 0 }, "totalNtlUsd": 16000000,
+             "message": "BTC: $16.00M of longs liquidated in the last 15m (8 forced orders; threshold $15.00M)",
+             "delivered": true, "deliveryError": null }] }
+```
+
+`GET /v1/alerts/rules` is the live board: every rule with its threshold, the current window value, `pctOfThreshold` (how close the next alert is), `active` (fired and not yet re-armed), and `lastFiredAt`. `evaluatorStale` flips true when the collector hasn't evaluated in 5 minutes.
+
+Semantics:
+- **Edge-triggered with hysteresis.** A rule fires once when its window value crosses the threshold, then stays `active` until the value drops below `LIQ_ALERT_REARM_PCT`% of the threshold (fills aging out of the trailing window). A cascade produces one alert per rule, not one per evaluation, and a value hovering around the threshold doesn't flap. Once re-armed, a fresh crossing fires again.
+- **State survives restarts** (`liq_alert_rules`): an alert already sent is not re-sent after a redeploy, and a crossing that happened during downtime fires on boot with the current value.
+- **Values are the recorder's floors.** Liquidations are classified a few seconds to minutes after they print (and backfilled after downtime), so the window value can keep climbing after an alert; the alert carries the value at detection time. See the liquidation recorder's coverage notes above.
+- **Delivery.** Every alert is logged (`[alerts] ALERT …`), stored, and — with `LIQ_ALERT_WEBHOOK_URL` set — POSTed as JSON. Discord and Slack incoming-webhook URLs are auto-detected and receive a one-line message (`content` / `text`); anything else gets `{ "type": "liquidation_threshold", "alert": { …same shape as /v1/alerts… } }`. Three attempts with backoff; the outcome lands in `delivered` / `deliveryError` on the row and failures are also written to `ops_events`.
+- Rule changes take effect on the next collector boot. Coin names are Hyperliquid's exact spelling (`BTC`, `ETH`, `kPEPE`); an unknown coin is logged as a warning rather than silently never firing.
+
 ### `GET /health`
 `{ok, lastTickAt, tickAgeSec, ticksStale, liveCoins}` — wire this to Railway's healthcheck.
 
@@ -218,6 +256,6 @@ How this works — and its honest semantics (Hyperliquid has **no** liquidation 
 
 - **Spot markets** — `spotMetaAndAssetCtxs` gives the same snapshot for all spot pairs; same tick/candle pattern (no OI/funding there).
 - **Cross-venue funding** — `predictedFundings` returns HL vs Binance vs Bybit rates + intervals per coin → funding-arb endpoints.
-- **Leaderboards & signals** — OI-up-price-down divergence, funding flips, new-listing alerts; all derivable from existing tables.
+- **Leaderboards & signals** — OI-up-price-down divergence, funding flips, new-listing alerts; all derivable from existing tables (liquidation threshold alerts exist today — see `/v1/alerts`).
 - **Gap repair** — backfill price candles from HL `candleSnapshot` after downtime (1m ≈ 3.5d retained upstream, 1h ≈ 208d).
 - **Third-party hardening** — API keys + per-key rate limits, OpenAPI spec, SSE/WS push.
