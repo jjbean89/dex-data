@@ -2,10 +2,11 @@ import { config } from "../config.js";
 import { opsEvent } from "../db/ops.js";
 import { pool } from "../db/pool.js";
 import { hl, sleep } from "../hl/client.js";
+import type { UserFill } from "../hl/types.js";
 import { log, logErr } from "../log.js";
 import { logBridgeError, pollBridge } from "./bridge.js";
 import type { TradeTape } from "./tape.js";
-import { refreshWalletState, type WalletState } from "./wallet-state.js";
+import { refreshWalletState, type WalletPosition, type WalletState } from "./wallet-state.js";
 import { formatUsd, sendWebhook, webhookConfigured, webhookFormat } from "./webhook.js";
 
 // Whale discovery.
@@ -14,10 +15,17 @@ import { formatUsd, sendWebhook, webhookConfigured, webhookFormat } from "./webh
 //    (see bridge.ts). Any address whose deposits over the trailing
 //    WHALE_WINDOW_HOURS sum to WHALE_MIN_USD or more becomes a whale_wallets row.
 // 2. Watch loop: flagged wallets are polled on Hyperliquid (clearinghouseState,
-//    weight 2) until they show an open position or WHALE_WATCH_HOURS elapse,
+//    weight 2) until they open a large position or WHALE_WATCH_HOURS elapse,
 //    then slowly afterwards. The first poll also reads the wallet's ledger from
 //    time zero (one userNonFundingLedgerUpdates call) — its first entry is the
-//    account's age, which separates a brand-new whale from a known one topping up.
+//    account's age, which separates a brand-new whale from a known one topping up
+//    — and reconstructs what the wallet held BEFORE the deposit: current positions
+//    minus the net of its fills since the first deposit (one userFillsByTime call).
+//    "Opened a position" means a position that is not in that baseline — a new
+//    coin, or a side flip — so a known account adding to thirty existing shorts
+//    is not an event, but the same account opening a fresh one is. The alert
+//    fires once per episode, when the newly opened positions reach
+//    WHALE_POSITION_MIN_USD of notional.
 // 3. Tape hook: the trades WebSocket names both parties of every fill, so a
 //    watched wallet's first fill is caught the moment it happens, at zero API
 //    cost, and triggers an immediate state refresh.
@@ -25,7 +33,9 @@ import { formatUsd, sendWebhook, webhookConfigured, webhookFormat } from "./webh
 // Budget: $1M+ depositors are a handful per day, so the watch loop's requests
 // are negligible next to the positions bootstrapper.
 
-const POSITIONED_RECHECK_MS = 900_000; // positioned wallets: refresh account value every 15 min
+const ALERTED_RECHECK_MS = 900_000; // after the position alert: refresh account value every 15 min
+const FILL_CAP = 2000; // userFillsByTime returns at most this many fills
+const SZ_EPS = 1e-6; // float residue from summing fill sizes
 const WATCH_BATCH = 100;
 const STATS_INTERVAL_MS = 300_000;
 
@@ -40,6 +50,45 @@ interface WatchRow {
   first_trade_at: Date | null;
   funded_alerted_at: Date | null;
   position_alerted_at: Date | null;
+  baseline_positions: BaselinePosition[] | null;
+}
+
+// A position the wallet held as of the episode's first deposit.
+interface BaselinePosition {
+  coin: string;
+  szi: number;
+}
+
+function notional(p: WalletPosition): number {
+  if (p.positionValue !== null) return Math.abs(p.positionValue);
+  return p.entryPx !== null ? Math.abs(p.szi) * p.entryPx : 0;
+}
+
+// Positions opened after funding: a coin the wallet did not hold at its first
+// deposit, or one whose side has flipped since. Adding to an existing position
+// is not an opening.
+export function openedSince(baseline: BaselinePosition[], positions: WalletPosition[]): WalletPosition[] {
+  const before = new Map(baseline.map((b) => [b.coin, b.szi]));
+  return positions.filter((p) => {
+    const prev = before.get(p.coin);
+    return prev === undefined || Math.abs(prev) < SZ_EPS || Math.sign(prev) !== Math.sign(p.szi);
+  });
+}
+
+// Reconstructs the wallet's perp positions at the start of `fills` from its
+// current positions: unwind each fill (a buy added sz, a sell removed it). Spot
+// fills ride the same feed ("PURR/USDC", "@107") and are skipped.
+export function rewindPositions(positions: WalletPosition[], fills: UserFill[]): BaselinePosition[] {
+  const szi = new Map(positions.map((p) => [p.coin, p.szi]));
+  for (const f of fills) {
+    if (f.coin.includes("/") || f.coin.startsWith("@")) continue;
+    const sz = parseFloat(f.sz);
+    if (!Number.isFinite(sz)) continue;
+    szi.set(f.coin, (szi.get(f.coin) ?? 0) - (f.side === "B" ? sz : -sz));
+  }
+  const out: BaselinePosition[] = [];
+  for (const [coin, v] of szi) if (Math.abs(v) >= SZ_EPS) out.push({ coin, szi: v });
+  return out;
 }
 
 type WhaleAlertKind = "funded" | "positioned";
@@ -123,6 +172,7 @@ export function startWhaleTracker(isStopped: () => boolean, tape: TradeTape | nu
          positioned_at    = case when whale_wallets.watch_until < now() then null else whale_wallets.positioned_at end,
          funded_alerted_at   = case when whale_wallets.watch_until < now() then null else whale_wallets.funded_alerted_at end,
          position_alerted_at = case when whale_wallets.watch_until < now() then null else whale_wallets.position_alerted_at end,
+         baseline_positions  = case when whale_wallets.watch_until < now() then null else whale_wallets.baseline_positions end,
          last_deposit_at  = excluded.last_deposit_at,
          watch_until      = excluded.watch_until,
          state_checked_at = null
@@ -153,13 +203,16 @@ export function startWhaleTracker(isStopped: () => boolean, tape: TradeTape | nu
     state: WalletState,
     isNew: boolean | null,
     ledgerFirst: Date | null,
+    opened: WalletPosition[],
     message: string,
   ): Promise<void> {
     const positions = state.positions.map((p) => ({ coin: p.coin, side: p.szi > 0 ? "long" : "short", sz: Math.abs(p.szi), entryPx: p.entryPx }));
+    const openedRows = opened.map((p) => ({ coin: p.coin, side: p.szi > 0 ? "long" : "short", sz: Math.abs(p.szi), entryPx: p.entryPx, ntlUsd: notional(p) }));
+    const openedNtl = opened.reduce((acc, p) => acc + notional(p), 0);
     const { rows } = await pool.query<{ id: string; ts: Date }>(
-      `insert into whale_alerts (kind, address, deposited_usd, account_value, total_ntl_pos, is_new_account, ledger_first_at, positions, message, delivered)
-       values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10) returning id, ts`,
-      [kind, w.address, w.deposited_usd, state.accountValue, state.totalNtlPos, isNew, ledgerFirst, JSON.stringify(positions), message, webhookOn ? false : null],
+      `insert into whale_alerts (kind, address, deposited_usd, account_value, total_ntl_pos, is_new_account, ledger_first_at, positions, opened, message, delivered)
+       values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11) returning id, ts`,
+      [kind, w.address, w.deposited_usd, state.accountValue, state.totalNtlPos, isNew, ledgerFirst, JSON.stringify(positions), JSON.stringify(openedRows), message, webhookOn ? false : null],
     );
     alerts++;
     log("whales", `ALERT ${message}`);
@@ -181,6 +234,8 @@ export function startWhaleTracker(isStopped: () => boolean, tape: TradeTape | nu
         isNewAccount: isNew,
         ledgerFirstAt: ledgerFirst ? ledgerFirst.toISOString() : null,
         positions,
+        opened: openedRows,
+        openedNtlUsd: openedNtl,
         explorer: `${EXPLORER_URL}${w.address}`,
         message,
       },
@@ -205,23 +260,42 @@ export function startWhaleTracker(isStopped: () => boolean, tape: TradeTape | nu
     );
   }
 
-  function positionedMessage(w: WatchRow, state: WalletState, ageLabel: string): string {
-    const parts = state.positions
+  // Leads with what was newly opened; the wallet's overall book is context.
+  function positionedMessage(w: WatchRow, state: WalletState, opened: WalletPosition[], heldBefore: number, ageLabel: string): string {
+    const parts = opened
       .slice()
-      .sort((a, b) => Math.abs(b.szi) * (b.entryPx ?? 0) - Math.abs(a.szi) * (a.entryPx ?? 0))
+      .sort((a, b) => notional(b) - notional(a))
       .slice(0, 4)
       .map((p) => {
-        const ntl = p.entryPx !== null ? ` ${formatUsd(Math.abs(p.szi) * p.entryPx)}` : "";
+        const ntl = notional(p) > 0 ? ` ${formatUsd(notional(p))}` : "";
         const px = p.entryPx !== null ? ` @ ${p.entryPx}` : "";
         return `${p.szi > 0 ? "long" : "short"} ${p.coin}${ntl}${px}`;
       });
-    const more = state.positions.length > 4 ? ` (+${state.positions.length - 4} more)` : "";
-    const total = state.totalNtlPos !== null ? ` — ${formatUsd(state.totalNtlPos)} total notional` : "";
+    const more = opened.length > 4 ? ` (+${opened.length - 4} more)` : "";
+    const openedNtl = opened.reduce((acc, p) => acc + notional(p), 0);
+    const held = heldBefore > 0 ? ` on top of ${heldBefore} position${heldBefore === 1 ? "" : "s"} held before funding` : "";
+    const total = state.totalNtlPos !== null ? `, ${formatUsd(state.totalNtlPos)} total notional` : "";
     const acct = state.accountValue !== null ? `, account ${formatUsd(state.accountValue)}` : "";
     return (
-      `Whale opened a position: ${shortAddr(w.address)} ${parts.join(", ")}${more}${total}${acct}. ` +
+      `Whale opened a new position: ${shortAddr(w.address)} ${parts.join(", ")}${more} — ${formatUsd(openedNtl)} newly opened${held}${total}${acct}. ` +
       `Bridged ${formatUsd(w.deposited_usd)} ${ago(w.last_deposit_at)}, ${ageLabel}. ${EXPLORER_URL}${w.address}`
     );
+  }
+
+  // What the wallet held at its first deposit of this episode: the current
+  // positions with every fill since then unwound. A wallet too busy for one
+  // fills page (2000+ fills since the deposit) is a market maker, not a whale
+  // taking a view — its current book stands in as the baseline, so nothing it
+  // already trades can alert; a new coin still can.
+  async function baselineFor(w: WatchRow, state: WalletState): Promise<BaselinePosition[]> {
+    const fills = await hl.userFillsByTime(w.address, w.first_deposit_at.getTime(), state.time);
+    if (fills.length >= FILL_CAP) {
+      const msg = `fills since deposit hit the ${FILL_CAP}-fill cap for ${w.address} — using its current positions as the pre-funding baseline`;
+      log("whales", msg);
+      await opsEvent("whales", "warn", msg);
+      return state.positions.map((p) => ({ coin: p.coin, szi: p.szi }));
+    }
+    return rewindPositions(state.positions, fills);
   }
 
   async function bridgeLoop(): Promise<void> {
@@ -263,7 +337,20 @@ export function startWhaleTracker(isStopped: () => boolean, tape: TradeTape | nu
   async function checkWallet(w: WatchRow): Promise<void> {
     const state = await refreshWalletState(w.address);
     checks++;
-    const hasPosition = state.positions.length > 0;
+    let baseline = w.baseline_positions;
+    let baselineTaken = false;
+    if (baseline === null) {
+      try {
+        baseline = await baselineFor(w, state);
+        baselineTaken = true;
+      } catch (err) {
+        logErr("whales", `fills check failed for ${w.address} — pre-funding baseline deferred to the next check`, err);
+      }
+    }
+    const opened = baseline ? openedSince(baseline, state.positions) : [];
+    const openedNtl = opened.reduce((acc, p) => acc + notional(p), 0);
+    // For a wallet that held nothing before funding, its first fill on the tape IS the opening.
+    const openedAt = opened.length > 0 ? (baseline?.length === 0 && w.first_trade_at ? w.first_trade_at : new Date()) : null;
     let ledgerFirst: Date | null = null;
     let ledgerChecked = false;
     if (w.ledger_checked_at === null) {
@@ -278,21 +365,27 @@ export function startWhaleTracker(isStopped: () => boolean, tape: TradeTape | nu
     await pool.query(
       `update whale_wallets set
          account_value = $2, total_ntl_pos = $3, state_checked_at = now(),
-         positioned_at = case when $4::boolean then coalesce(positioned_at, first_trade_at, now()) else positioned_at end,
+         positioned_at = coalesce(positioned_at, $4::timestamptz),
          ledger_first_at = case when $5::boolean then $6 else ledger_first_at end,
-         ledger_checked_at = case when $5::boolean then now() else ledger_checked_at end
+         ledger_checked_at = case when $5::boolean then now() else ledger_checked_at end,
+         baseline_positions = case when $7::boolean then $8::jsonb else baseline_positions end
        where address = $1`,
-      [w.address, state.accountValue, state.totalNtlPos, hasPosition, ledgerChecked, ledgerFirst],
+      [w.address, state.accountValue, state.totalNtlPos, openedAt, ledgerChecked, ledgerFirst, baselineTaken, baselineTaken ? JSON.stringify(baseline) : null],
     );
+    if (baselineTaken && baseline) {
+      log("whales", `${w.address} held ${baseline.length} position${baseline.length === 1 ? "" : "s"} at its first deposit${opened.length > 0 ? `, ${opened.length} opened since` : ""}`);
+    }
     const ledgerKnown = ledgerChecked || w.ledger_checked_at !== null;
     const ledgerFirstAt = ledgerChecked ? ledgerFirst : w.ledger_first_at;
     const age = accountAge(ledgerFirstAt, ledgerKnown);
     if (w.funded_alerted_at === null) {
-      if (alertKinds.has("funded")) await fireAlert("funded", w, state, age.isNew, ledgerFirstAt, fundedMessage(w, state, age.label));
+      if (alertKinds.has("funded")) await fireAlert("funded", w, state, age.isNew, ledgerFirstAt, [], fundedMessage(w, state, age.label));
       await pool.query("update whale_wallets set funded_alerted_at = now() where address = $1", [w.address]);
     }
-    if (hasPosition && w.position_alerted_at === null) {
-      if (alertKinds.has("positioned")) await fireAlert("positioned", w, state, age.isNew, ledgerFirstAt, positionedMessage(w, state, age.label));
+    if (baseline && opened.length > 0 && openedNtl >= config.whalePositionMinUsd && w.position_alerted_at === null) {
+      if (alertKinds.has("positioned")) {
+        await fireAlert("positioned", w, state, age.isNew, ledgerFirstAt, opened, positionedMessage(w, state, opened, baseline.length, age.label));
+      }
       await pool.query("update whale_wallets set position_alerted_at = now() where address = $1", [w.address]);
     }
   }
@@ -308,15 +401,15 @@ export function startWhaleTracker(isStopped: () => boolean, tape: TradeTape | nu
         wake = false; // anything flagged from here on wakes the next pass early
         const { rows } = await pool.query<WatchRow>(
           `select address, deposited_usd, first_deposit_at, last_deposit_at, ledger_checked_at, ledger_first_at,
-                  positioned_at, first_trade_at, funded_alerted_at, position_alerted_at
+                  positioned_at, first_trade_at, funded_alerted_at, position_alerted_at, baseline_positions
            from whale_wallets
            where address = any($1::text[])
               or (watch_until > now() and (
                     state_checked_at is null
-                 or (positioned_at is null and state_checked_at < now() - make_interval(secs => $2))
-                 or (positioned_at is not null and state_checked_at < now() - make_interval(secs => $3))))
+                 or (position_alerted_at is null and state_checked_at < now() - make_interval(secs => $2))
+                 or (position_alerted_at is not null and state_checked_at < now() - make_interval(secs => $3))))
            order by state_checked_at asc nulls first limit $4`,
-          [urgent, Math.floor(config.whaleWatchPollMs / 1000) - 5, POSITIONED_RECHECK_MS / 1000, WATCH_BATCH],
+          [urgent, Math.floor(config.whaleWatchPollMs / 1000) - 5, ALERTED_RECHECK_MS / 1000, WATCH_BATCH],
         );
         for (const w of rows) {
           if (isStopped()) return;
@@ -362,7 +455,7 @@ export function startWhaleTracker(isStopped: () => boolean, tape: TradeTape | nu
   const loops = [bridgeLoop(), watchLoop(), statsLoop()];
   log(
     "whales",
-    `tracker started (bridge poll ${config.bridgePollMs}ms via ${new URL(config.arbitrumRpcUrl).host}, threshold $${config.whaleMinUsd.toLocaleString("en-US")} per ${config.whaleWindowHours}h, watch ${config.whaleWatchHours}h${tape ? ", tape hook on" : ""}, alerts ${[...alertKinds].join("+") || "off"} → ${webhookOn ? webhookFormat() : "log only"})`,
+    `tracker started (bridge poll ${config.bridgePollMs}ms via ${new URL(config.arbitrumRpcUrl).host}, threshold $${config.whaleMinUsd.toLocaleString("en-US")} per ${config.whaleWindowHours}h, watch ${config.whaleWatchHours}h, position alert ≥ $${config.whalePositionMinUsd.toLocaleString("en-US")}${tape ? ", tape hook on" : ""}, alerts ${[...alertKinds].join("+") || "off"} → ${webhookOn ? webhookFormat() : "log only"})`,
   );
 
   return async () => {

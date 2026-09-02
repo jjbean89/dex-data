@@ -267,6 +267,8 @@ function serializeWhale(r: WhaleRow, positions: WalletPositionRow[], marks: Map<
       ? null
       : r.ledger_first_at !== null && r.ledger_first_at.getTime() >= r.first_at.getTime() - 600_000;
   const accountAgeDays = r.ledger_first_at ? (Date.now() - r.ledger_first_at.getTime()) / 86_400_000 : null;
+  // Held at the first deposit of this episode (null until the tracker's first check).
+  const before = r.baseline_positions ? new Map(r.baseline_positions.map((b) => [b.coin, b.szi])) : null;
   let totalNtlUsd = 0;
   const pos = positions.map((p) => {
     const mark = marks.get(p.coin) ?? null;
@@ -281,6 +283,8 @@ function serializeWhale(r: WhaleRow, positions: WalletPositionRow[], marks: Map<
       entryPx: p.entry_px,
       markPx: mark,
       unrealizedPnlUsd: pnl,
+      // Not held (or held the other way) when the wallet was funded — a new position, not a top-up.
+      openedAfterFunding: before === null ? null : !before.has(p.coin) || Math.sign(before.get(p.coin) ?? 0) !== Math.sign(p.szi),
       updatedAt: p.updated_at.toISOString(),
     };
   });
@@ -1436,6 +1440,7 @@ export function registerRoutes(app: FastifyInstance): void {
         isNewAccount: r.is_new_account,
         ledgerFirstAt: r.ledger_first_at ? r.ledger_first_at.toISOString() : null,
         positions: r.positions,
+        opened: r.opened,
         message: r.message,
         delivered: r.delivered,
         deliveryError: r.delivery_error,

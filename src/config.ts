@@ -221,6 +221,9 @@ export const config = {
   whaleWindowHours: numEnv("WHALE_WINDOW_HOURS", 1),
   whaleWatchHours: numEnv("WHALE_WATCH_HOURS", 24),
   whaleWatchPollMs: numEnv("WHALE_WATCH_POLL_MS", 60_000),
+  // "positioned" alerts need this much notional in positions opened after funding
+  // (new coin or side flip vs. what the wallet held at its first deposit); 0 = any size.
+  whalePositionMinUsd: numEnv("WHALE_POSITION_MIN_USD", 1_000_000),
   // Whale alerts go to the same webhook as the liquidation alerts (LIQ_ALERT_WEBHOOK_URL).
   whaleAlertEvents: listEnv("WHALE_ALERT_EVENTS", "funded,positioned"),
 
@@ -314,6 +317,7 @@ export function assertConfig(): void {
       throw new Error("WHALE_WATCH_HOURS must be between 1 and 720");
     }
     if (config.whaleWatchPollMs < 10_000) throw new Error("WHALE_WATCH_POLL_MS below 10000ms would burn clearinghouseState budget");
+    if (!(config.whalePositionMinUsd >= 0)) throw new Error("WHALE_POSITION_MIN_USD must be zero or positive");
     if (config.bridgeRetentionDays < 1) throw new Error("BRIDGE_RETENTION_DAYS must be at least 1");
     for (const e of config.whaleAlertEvents) {
       if (e !== "funded" && e !== "positioned") {

@@ -10,9 +10,11 @@ export interface WalletPosition {
   coin: string;
   szi: number;
   entryPx: number | null;
+  positionValue: number | null; // |szi| × mark, as HL reports it
 }
 
 export interface WalletState {
+  time: number; // HL's timestamp of the snapshot (ms)
   accountValue: number | null;
   totalNtlPos: number | null;
   positions: WalletPosition[];
@@ -30,7 +32,7 @@ export async function refreshWalletState(addr: string): Promise<WalletState> {
   for (const ap of state.assetPositions) {
     const szi = parseFloat(ap.position.szi);
     if (!Number.isFinite(szi) || szi === 0) continue;
-    positions.push({ coin: ap.position.coin, szi, entryPx: num(ap.position.entryPx) });
+    positions.push({ coin: ap.position.coin, szi, entryPx: num(ap.position.entryPx), positionValue: num(ap.position.positionValue) });
   }
   const client = await pool.connect();
   try {
@@ -56,6 +58,7 @@ export async function refreshWalletState(addr: string): Promise<WalletState> {
     client.release();
   }
   return {
+    time: typeof state.time === "number" && Number.isFinite(state.time) ? state.time : Date.now(),
     accountValue: num(state.marginSummary?.accountValue),
     totalNtlPos: num(state.marginSummary?.totalNtlPos),
     positions,
