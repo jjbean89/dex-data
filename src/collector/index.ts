@@ -13,7 +13,7 @@ import { startTradeTape } from "./tape.js";
 import { collectTick } from "./ticks.js";
 import { startVolumeRecorder } from "./volume.js";
 import { startVolumeSignals } from "./volume-signals.js";
-import { startWhaleTracker } from "./whales.js";
+import { startLiqWhaleTracker } from "./liq-whales.js";
 
 const RETENTION_INTERVAL_MS = 3_600_000;
 
@@ -169,7 +169,7 @@ export function startCollector(): () => Promise<void> {
     stops.push(startLiqAlerts(isStopped));
   }
   if (config.liquidationsEnabled && config.liqWhaleThresholdUsd > 0) {
-    stops.push(startWhaleTracker(isStopped));
+    stops.push(startLiqWhaleTracker(isStopped));
   }
   if (tape && config.volumeEnabled) {
     stops.push(startVolumeRecorder(isStopped, tape));

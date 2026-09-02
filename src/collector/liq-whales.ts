@@ -43,7 +43,7 @@ export function explorerUrl(wallet: string): string {
   return `https://app.hyperliquid.xyz/explorer/address/${wallet}`;
 }
 
-export function startWhaleTracker(isStopped: () => boolean): () => Promise<void> {
+export function startLiqWhaleTracker(isStopped: () => boolean): () => Promise<void> {
   const threshold = config.liqWhaleThresholdUsd;
   const windowMs = config.liqWhaleWindow.ms;
   const open = new Map<string, Episode>(); // wallet → open episode
