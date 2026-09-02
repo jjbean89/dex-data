@@ -1,8 +1,9 @@
 import { config } from "../config.js";
 import { pool } from "../db/pool.js";
-import { hl, sleep } from "../hl/client.js";
+import { sleep } from "../hl/client.js";
 import { log, logErr } from "../log.js";
 import type { TradeTape } from "./tape.js";
+import { refreshWalletState } from "./wallet-state.js";
 
 // Long/short trader tracking.
 //
@@ -153,40 +154,7 @@ export function startPositionsTracker(isStopped: () => boolean, tape: TradeTape)
   }
 
   async function bootstrapWallet(addr: string): Promise<void> {
-    const state = await hl.clearinghouseState(addr);
-    const pCoins: string[] = [];
-    const pSzi: number[] = [];
-    const pEntry: Array<number | null> = [];
-    for (const ap of state.assetPositions) {
-      const szi = parseFloat(ap.position.szi);
-      if (!Number.isFinite(szi) || szi === 0) continue;
-      pCoins.push(ap.position.coin);
-      pSzi.push(szi);
-      const entry = parseFloat(ap.position.entryPx ?? "");
-      pEntry.push(Number.isFinite(entry) ? entry : null);
-    }
-    const client = await pool.connect();
-    try {
-      await client.query("begin");
-      await client.query("delete from positions where address = $1", [addr]);
-      if (pCoins.length > 0) {
-        await client.query(
-          `insert into positions (address, coin, szi, entry_px, updated_at)
-           select $1::text, u.*, now() from unnest($2::text[], $3::float8[], $4::float8[]) as u`,
-          [addr, pCoins, pSzi, pEntry],
-        );
-      }
-      await client.query(
-        "update traders set bootstrap_pending = false, bootstrapped_at = now() where address = $1",
-        [addr],
-      );
-      await client.query("commit");
-    } catch (err) {
-      await client.query("rollback");
-      throw err;
-    } finally {
-      client.release();
-    }
+    await refreshWalletState(addr);
   }
 
   async function takeSnapshot(): Promise<void> {

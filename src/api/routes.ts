@@ -15,6 +15,10 @@ import {
   latestPositioningFor,
   latestTicks,
   lastLiqAt,
+  bridgeStatus,
+  openPositionsFor,
+  recentBridgeDeposits,
+  whaleWallets,
   liqCandles,
   liqTotals,
   marketCandles,
@@ -39,6 +43,8 @@ import {
   type PerpCandleRow,
   type PositioningRow,
   type TickRow,
+  type WalletPositionRow,
+  type WhaleRow,
 } from "./queries.js";
 import { aprPct, cached, parseLimit, parseTimeMs, parseWindow, pctChange, rollingMean } from "./util.js";
 
@@ -232,6 +238,72 @@ function serializeLiqTotals(r: LiqTotalsRow | undefined): Record<string, unknown
   };
 }
 
+function bridgeWarmingUp(reply: FastifyReply): FastifyReply {
+  return reply.code(503).send({
+    error: {
+      code: "no_bridge_data",
+      message: "no bridge deposits scanned yet — the whale tracker is off (WHALES_ENABLED=false) or still on its first poll",
+    },
+  });
+}
+
+function serializeBridgeStatus(s: { last_block: string; updated_at: Date; last_deposit_at: Date | null }): Record<string, unknown> {
+  const ageSec = Math.round((Date.now() - s.updated_at.getTime()) / 1000);
+  return {
+    lastBlock: Number(s.last_block),
+    syncedAt: s.updated_at.toISOString(),
+    syncAgeSec: ageSec,
+    stale: ageSec > 300,
+    lastDepositAt: s.last_deposit_at ? s.last_deposit_at.toISOString() : null,
+  };
+}
+
+function serializeWhale(r: WhaleRow, positions: WalletPositionRow[], marks: Map<string, number | null>): Record<string, unknown> {
+  const iso = (d: Date | null): string | null => (d ? d.toISOString() : null);
+  // A brand-new account's first ledger entry IS its first deposit of this episode.
+  const isNewAccount =
+    r.ledger_checked_at === null
+      ? null
+      : r.ledger_first_at !== null && r.ledger_first_at.getTime() >= r.first_at.getTime() - 600_000;
+  const accountAgeDays = r.ledger_first_at ? (Date.now() - r.ledger_first_at.getTime()) / 86_400_000 : null;
+  let totalNtlUsd = 0;
+  const pos = positions.map((p) => {
+    const mark = marks.get(p.coin) ?? null;
+    const ntlUsd = mark !== null ? Math.abs(p.szi) * mark : null;
+    if (ntlUsd !== null) totalNtlUsd += ntlUsd;
+    const pnl = mark !== null && p.entry_px !== null ? (mark - p.entry_px) * p.szi : null;
+    return {
+      coin: p.coin,
+      side: p.szi > 0 ? "long" : "short",
+      sz: Math.abs(p.szi),
+      ntlUsd,
+      entryPx: p.entry_px,
+      markPx: mark,
+      unrealizedPnlUsd: pnl,
+      updatedAt: p.updated_at.toISOString(),
+    };
+  });
+  return {
+    address: r.address,
+    deposits: { usd: r.deposited_usd, n: r.n_deposits, firstAt: r.first_at.toISOString(), lastAt: r.last_at.toISOString() },
+    flaggedAt: iso(r.flagged_at),
+    watchUntil: iso(r.watch_until),
+    account: {
+      valueUsd: r.account_value,
+      totalNtlPosUsd: r.total_ntl_pos,
+      checkedAt: iso(r.state_checked_at),
+    },
+    ledgerFirstAt: iso(r.ledger_first_at),
+    isNewAccount,
+    accountAgeDays: accountAgeDays !== null ? Math.round(accountAgeDays * 100) / 100 : null,
+    firstTradeAt: iso(r.first_trade_at),
+    positionedAt: iso(r.positioned_at),
+    hasOpenPosition: r.has_position,
+    openNtlUsd: positions.length > 0 ? totalNtlUsd : 0,
+    positions: pos,
+  };
+}
+
 function serializeLiqFill(r: LiqFillRow, includeCoin: boolean): Record<string, unknown> {
   return {
     t: r.ts.toISOString(),
@@ -247,7 +319,7 @@ function serializeLiqFill(r: LiqFillRow, includeCoin: boolean): Record<string, u
   };
 }
 
-function serializeWhale(r: LiqWhaleRow): Record<string, unknown> {
+function serializeLiqWhale(r: LiqWhaleRow): Record<string, unknown> {
   return {
     id: r.id,
     wallet: r.wallet,
@@ -527,6 +599,8 @@ export function registerRoutes(app: FastifyInstance): void {
       "GET /v1/signals?coin=&status=open|confirmed|expired&since=&marketWide=&limit=100",
       "GET /v1/alerts?coin=&window=&side=long|short|total&since=&limit=100",
       "GET /v1/alerts/rules",
+      "GET /v1/whales/new?window=1h&minUsd=1000000&positioned=true|false&newOnly=false&limit=100",
+      "GET /v1/bridge/deposits?window=24h&minUsd=100000&limit=100",
     ],
   }));
 
@@ -1232,7 +1306,7 @@ export function registerRoutes(app: FastifyInstance): void {
       ...(active !== undefined ? { active } : {}),
       limit,
     });
-    return { count: rows.length, data: rows.map(serializeWhale) };
+    return { count: rows.length, data: rows.map(serializeLiqWhale) };
   });
 
   app.get("/v1/market/liquidations/recent", async (req, reply) => {
@@ -1268,5 +1342,97 @@ export function registerRoutes(app: FastifyInstance): void {
       .filter((r) => r.tMs >= range.fromMs)
       .slice(-range.limit);
     return { interval: range.interval, smooth: q.smooth ?? null, count: data.length, data };
+  });
+
+  // ---- Whale discovery ----
+
+  // Wallets whose Arbitrum→Hyperliquid bridge deposits over the trailing window
+  // total at least minUsd, with what the watcher knows about each on Hyperliquid:
+  // account value, account age (first ledger entry), first fill on the tape,
+  // and their open positions marked at the live price.
+  app.get("/v1/whales/new", async (req, reply) => {
+    const q = req.query as Query;
+    const windowRaw = q.window ?? "1h";
+    const windowMs = parseWindow(windowRaw);
+    const maxWindowMs = config.bridgeRetentionDays * 86_400_000;
+    if (windowMs === null || windowMs < 60_000 || windowMs > maxWindowMs) {
+      return bad(reply, `invalid window "${windowRaw}" — use 1m…${config.bridgeRetentionDays}d`);
+    }
+    const minUsd = q.minUsd === undefined || q.minUsd === "" ? config.whaleMinUsd : Number(q.minUsd);
+    if (!Number.isFinite(minUsd) || minUsd < 0) return bad(reply, "invalid minUsd");
+    let positioned: boolean | null = null;
+    if (q.positioned !== undefined && q.positioned !== "") {
+      if (q.positioned !== "true" && q.positioned !== "false") return bad(reply, 'positioned must be "true" or "false"');
+      positioned = q.positioned === "true";
+    }
+    if (q.newOnly !== undefined && q.newOnly !== "" && q.newOnly !== "true" && q.newOnly !== "false") {
+      return bad(reply, 'newOnly must be "true" or "false"');
+    }
+    const newOnly = q.newOnly === "true";
+    const limit = parseLimit(q.limit, 100, 500);
+    if (limit === null) return bad(reply, "invalid limit");
+
+    const status = await cached("bridge:status", CACHE_MS, bridgeStatus);
+    if (!status) return bridgeWarmingUp(reply);
+    const { rows, positions, ticks } = await cached(
+      `whales:${windowMs}:${minUsd}:${positioned}:${newOnly}:${limit}`,
+      CACHE_MS,
+      async () => {
+        const rows = await whaleWallets(windowMs, minUsd, positioned, newOnly, limit);
+        const [positions, ticks] = await Promise.all([openPositionsFor(rows.map((r) => r.address)), latestTicks()]);
+        return { rows, positions, ticks };
+      },
+    );
+    const marks = new Map(ticks.map((t) => [t.coin, t.mark_px]));
+    const byAddress = new Map<string, WalletPositionRow[]>();
+    for (const p of positions) {
+      const list = byAddress.get(p.address);
+      if (list) list.push(p);
+      else byAddress.set(p.address, [p]);
+    }
+    return {
+      window: windowRaw,
+      minUsd,
+      asOf: new Date().toISOString(),
+      bridge: serializeBridgeStatus(status),
+      count: rows.length,
+      data: rows.map((r) => serializeWhale(r, byAddress.get(r.address) ?? [], marks)),
+    };
+  });
+
+  // Raw bridge deposit feed, newest first (public on-chain data).
+  app.get("/v1/bridge/deposits", async (req, reply) => {
+    const q = req.query as Query;
+    const windowRaw = q.window ?? "24h";
+    const windowMs = parseWindow(windowRaw);
+    const maxWindowMs = config.bridgeRetentionDays * 86_400_000;
+    if (windowMs === null || windowMs < 60_000 || windowMs > maxWindowMs) {
+      return bad(reply, `invalid window "${windowRaw}" — use 1m…${config.bridgeRetentionDays}d`);
+    }
+    const minUsd = q.minUsd === undefined || q.minUsd === "" ? 100_000 : Number(q.minUsd);
+    if (!Number.isFinite(minUsd) || minUsd < 0) return bad(reply, "invalid minUsd");
+    const limit = parseLimit(q.limit, 100, 1_000);
+    if (limit === null) return bad(reply, "invalid limit");
+    const status = await cached("bridge:status", CACHE_MS, bridgeStatus);
+    if (!status) return bridgeWarmingUp(reply);
+    const rows = await cached(`bridge:deposits:${windowMs}:${minUsd}:${limit}`, CACHE_MS, () =>
+      recentBridgeDeposits(windowMs, minUsd, limit),
+    );
+    return {
+      window: windowRaw,
+      minUsd,
+      recordFloorUsd: config.bridgeMinRecordUsd,
+      bridge: serializeBridgeStatus(status),
+      count: rows.length,
+      data: rows.map((r) => ({
+        t: r.ts.toISOString(),
+        tMs: r.ts.getTime(),
+        address: r.address,
+        usdc: r.usdc,
+        txHash: r.tx_hash,
+        logIndex: r.log_index,
+        block: Number(r.block_number),
+      })),
+    };
   });
 }

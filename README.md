@@ -13,8 +13,9 @@ Custom Hyperliquid market data service. Hyperliquid's public API only exposes th
 - **Volume bars for every coin** — per-bar notional from the public trade tape (1m/5m/1h), split by taker side with TWAP flow flagged; Hyperliquid only exposes a rolling 24h number, so like OI this exists only if you record it
 - **Volume-leading-price signals** — abnormal volume while price is still flat, confirmed by open-interest growth or one-sided taker flow: the accumulation that precedes a move, with breakout confirmation after the fact
 - **EMAs for every coin on every timeframe** — EMA 21/200 on 1h/4h/12h/1d (all configurable), seeded from full candle history to match TradingView, plus the screener columns derived from them (price-vs-EMA %, EMA-vs-EMA cross spread) in one response
+- **New whale wallets** — every wallet that bridged $1M+ (configurable) into Hyperliquid in the last hour, whether the account is brand new, and whether it has opened a position yet (with the positions) — from the Arbitrum bridge's deposit logs joined to per-wallet Hyperliquid state; Hyperliquid's own API has no deposit feed at all
 
-One process polls `metaAndAssetCtxs` (every live perp in a single request) every 15s, rolls ticks up into 5m/1h candles, prunes raw data on a retention schedule, and runs the trades-WebSocket position tracker. A second process serves a read-only JSON API.
+One process polls `metaAndAssetCtxs` (every live perp in a single request) every 15s, rolls ticks up into 5m/1h candles, prunes raw data on a retention schedule, runs the trades-WebSocket position tracker, and polls the Arbitrum bridge for incoming deposits. A second process serves a read-only JSON API.
 
 ```
 ┌───────────┐   POST /info every 15s    ┌───────────┐        ┌───────────┐
@@ -112,6 +113,13 @@ Deploys are zero-drama: the collector shuts down gracefully on SIGTERM and the D
 | `VOL_SIGNAL_MAX_COINS` | `15` | More coins than this triggering together = market-wide event, notified once |
 | `VOL_SIGNAL_EXPIRE_MIN` / `VOL_SIGNAL_MIN_HISTORY_HOURS` | `120` / `6` | Signal lifetime without a breakout; bars needed before a coin is eligible |
 | `VOL_SIGNAL_NOTIFY` | `true` | Push signals and confirmations to the webhook |
+| `WHALES_ENABLED` | `true` | Bridge deposit watcher + whale wallet tracking (see `/v1/whales/new`) |
+| `ARBITRUM_RPC_URL` | `https://arb1.arbitrum.io/rpc` | Any Arbitrum One JSON-RPC endpoint (public works; a free provider key is steadier) |
+| `ARBITRUM_USDC_ADDRESS` / `HL_BRIDGE_ADDRESS` | native USDC / Bridge2 | Override for testnet |
+| `BRIDGE_POLL_MS` / `BRIDGE_CONFIRMATIONS` | `15000` / `10` | Poll cadence; blocks behind head to scan (reorg guard) |
+| `BRIDGE_BACKFILL_HOURS` / `BRIDGE_MIN_RECORD_USD` / `BRIDGE_RETENTION_DAYS` | `6` / `1000` / `90` | First-boot scan depth; smallest deposit recorded; raw deposit retention |
+| `WHALE_MIN_USD` / `WHALE_WINDOW_HOURS` | `1000000` / `1` | Flag a wallet when its deposits over the trailing window reach this |
+| `WHALE_WATCH_HOURS` / `WHALE_WATCH_POLL_MS` | `24` / `60000` | How long, and how often, a flagged wallet is polled on HL for its first position |
 | `HYPERTRACKER_API_KEY` | — | Enables the one-time starting-census import (see positioning docs below) |
 | `HYPERTRACKER_BASE_URL` / `HYPERTRACKER_REQ_DELAY_MS` | `https://ht-api.coinmarketman.com/api` / `1500` | Census source + pacing |
 | `PG_SSL_NO_VERIFY` | `false` | Accept self-signed Postgres TLS (Railway public proxy) |
@@ -315,6 +323,33 @@ Semantics:
 - **Records grow while the burst is open.** A wallet is recorded the moment its burst crosses the threshold (and pushed to the webhook once, as `🐋 …`); further liquidations within the window fold into the same record (`ntlUsd`, `events`, `coins`, `to` update) until the window passes with no new fills, then it freezes. Later liquidations of the same wallet start a new record.
 - **Late discovery still counts.** The tracker keys on when fills were recorded, not when they traded, so liquidations the recorder classifies late or backfills after downtime are collected too (a burst older than the window is recorded already closed).
 - Wallets are public on-chain addresses; `explorer` links to Hyperliquid's own explorer. Totals are the recorder's floors (see coverage notes above) — a large liquidation is exactly the flow the verification queue prioritises, so these are caught reliably in practice.
+### `GET /v1/whales/new?window=1h&minUsd=1000000`
+**New whale wallets**: every address whose deposits into Hyperliquid over the trailing window total at least `minUsd`, with what the tracker has learned about each on Hyperliquid — account value, account age, when it first traded, and its open positions marked at the live price. Params: `window` (`1m`…`{BRIDGE_RETENTION_DAYS}d`, default `1h`), `minUsd` (default `WHALE_MIN_USD`), `positioned` (`true` = only wallets with an open position right now, `false` = only funded-but-idle ones), `newOnly=true` (only brand-new accounts — first ledger entry ever is inside this deposit episode), `limit`. Sorted by deposited amount.
+
+```json
+{ "window": "1h", "minUsd": 1000000, "asOf": "2026-09-02T15:40:12.001Z",
+  "bridge": { "lastBlock": 380412991, "syncedAt": "2026-09-02T15:40:03.512Z", "syncAgeSec": 9, "stale": false, "lastDepositAt": "2026-09-02T15:39:58.000Z" },
+  "count": 1,
+  "data": [{ "address": "0x9a3c…e41b",
+             "deposits": { "usd": 2500000, "n": 2, "firstAt": "2026-09-02T15:02:11.000Z", "lastAt": "2026-09-02T15:04:40.000Z" },
+             "flaggedAt": "2026-09-02T15:04:52.118Z", "watchUntil": "2026-09-03T15:04:40.000Z",
+             "account": { "valueUsd": 2498120.4, "totalNtlPosUsd": 7400000.0, "checkedAt": "2026-09-02T15:39:31.204Z" },
+             "ledgerFirstAt": "2026-09-02T15:02:11.000Z", "isNewAccount": true, "accountAgeDays": 0.03,
+             "firstTradeAt": "2026-09-02T15:11:08.416Z", "positionedAt": "2026-09-02T15:11:08.416Z", "hasOpenPosition": true,
+             "openNtlUsd": 7400000.0,
+             "positions": [{ "coin": "BTC", "side": "long", "sz": 95.2, "ntlUsd": 7400000.0, "entryPx": 77510.0, "markPx": 77731.1,
+                             "unrealizedPnlUsd": 21048.7, "updatedAt": "2026-09-02T15:39:31.204Z" }] }] }
+```
+
+How this works — Hyperliquid's API cannot answer this question by itself:
+- **Every account endpoint on Hyperliquid is keyed by wallet** (the deposit ledger included) and the WebSocket's only global channels are market data, so there is nothing to poll or subscribe to for "who just got funded". But external money enters through the **Bridge2 contract on Arbitrum** as a plain USDC transfer whose *sender is the Hyperliquid account credited* (the app's gas-free path uses a permit; the Transfer event is still user → bridge). One `eth_getLogs` filter on the USDC contract with the bridge as recipient is therefore a complete, real-time feed of external deposits. The collector polls it every 15s from a stored block cursor (chunked, with the chunk size adapting to whatever cap the RPC enforces), records deposits ≥ `BRIDGE_MIN_RECORD_USD`, and flags any address whose deposits over the trailing `WHALE_WINDOW_HOURS` reach `WHALE_MIN_USD`. Downtime heals itself: the cursor resumes where it stopped (up to 7 days back).
+- **Flagged wallets are then watched on Hyperliquid.** One `clearinghouseState` (weight 2) per poll captures account value and open positions until the first position appears, then every 15 minutes for `WHALE_WATCH_HOURS`. The first check also reads the wallet's ledger from time zero (`userNonFundingLedgerUpdates`) — its first entry is the account's age, which is what `isNewAccount` and `accountAgeDays` report: a brand-new whale versus a known one topping up. If the trade tape is on, a watched wallet's first fill is caught the moment it prints (both parties of every fill are on the public tape) and triggers an immediate state refresh — `firstTradeAt` is exact to the fill, at zero API cost.
+- `positioned` filters on the **live** positions ledger (a wallet that opened and closed reads `false` with `positionedAt` set); the positions listed come from the same ledger the long/short tracker maintains, so they stay current from fills after the first check. `openNtlUsd` and `ntlUsd` are marked at the latest tick.
+- **What it misses, honestly:** money that never touches Arbitrum — transfers between Hyperliquid accounts, sub-account funding, HyperEVM→Core moves — and native-asset deposits through Hyperunit (those land as spot BTC/ETH/SOL, not USDC margin). A new wallet funded from an existing whale's Hyperliquid account is invisible here. A deposit routed through a contract that forwards funds could credit an address other than the transfer sender; the tracker records the sender.
+- Requests: the bridge watcher costs ~8 RPC calls per minute (head + logs per poll) plus one batched block lookup per poll that found deposits; whale polling is a handful of weight-2 calls per minute at most.
+
+### `GET /v1/bridge/deposits?window=24h&minUsd=100000`
+The raw deposit tape behind the whale board, newest first: `{t, address, usdc, txHash, logIndex, block}` for every recorded bridge deposit ≥ `minUsd` in the window (default `100000`; anything down to `BRIDGE_MIN_RECORD_USD` is available). Same `bridge` freshness block as above.
 
 ### `GET /health`
 `{ok, lastTickAt, tickAgeSec, ticksStale, liveCoins}` — wire this to Railway's healthcheck.
@@ -327,7 +362,7 @@ Semantics:
 - **Retention:** raw ticks 14d → 5m candles 180d → 1h candles forever (volume: 1m bars 30d, 5m 180d, 1h forever). `/changes` windows are bounded by raw retention; longer lookbacks come from the candle endpoints.
 - **Scale:** ~176 live coins × 4 ticks/min ≈ 1M rows/day raw, pruned at 14d ≈ 14M rows steady-state — comfortable for stock Postgres. If you later want years of raw ticks, TimescaleDB is a drop-in upgrade (deploy the `timescale/timescaledb` image as a Railway service instead of managed Postgres).
 - **Redundancy:** OI can't be backfilled, so if this becomes commercial, run a second collector against a second DB (different egress IP) as insurance.
-- **Cost levers**, in descending order of impact, if the Railway bill needs trimming: keep `DATABASE_URL` on the private network (see above); `POSITIONS_ENABLED=false` drops the wallet bootstrapper and the two largest tables (the WebSocket firehose stays if liquidations are on); `LIQUIDATIONS_ENABLED=false` drops the liquidation recorder and its verification traffic; `POLL_INTERVAL_MS=30000` halves raw-tick volume and write load with candles still built from 10 ticks per 5m bucket; `REVERIFY_BATCH` scales the background clearinghouseState traffic; `RAW_RETENTION_DAYS` bounds the biggest table. Everything already in place — watermarked rollups, batched writes, response compression, capped retention — needs no tuning.
+- **Cost levers**, in descending order of impact, if the Railway bill needs trimming: keep `DATABASE_URL` on the private network (see above); `POSITIONS_ENABLED=false` drops the wallet bootstrapper and the two largest tables (the WebSocket firehose stays if liquidations are on); `LIQUIDATIONS_ENABLED=false` drops the liquidation recorder and its verification traffic; `WHALES_ENABLED=false` drops the bridge watcher (no HL budget to speak of, but one fewer external dependency); `POLL_INTERVAL_MS=30000` halves raw-tick volume and write load with candles still built from 10 ticks per 5m bucket; `REVERIFY_BATCH` scales the background clearinghouseState traffic; `RAW_RETENTION_DAYS` bounds the biggest table. Everything already in place — watermarked rollups, batched writes, response compression, capped retention — needs no tuning.
 
 ## Roadmap
 

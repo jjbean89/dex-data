@@ -553,3 +553,109 @@ export async function marketOiCloseAt(targetMs: number): Promise<number | null> 
   );
   return rows[0]?.oi_usd_c ?? null;
 }
+
+// ---- Whale discovery (bridge deposits + watched wallets) ----
+
+export interface BridgeStatus {
+  last_block: string; // bigint arrives as a string
+  updated_at: Date;
+  last_deposit_at: Date | null;
+}
+
+export async function bridgeStatus(): Promise<BridgeStatus | null> {
+  const { rows } = await pool.query<BridgeStatus>(
+    `select s.last_block, s.updated_at, (select max(ts) from bridge_deposits) as last_deposit_at
+     from bridge_sync s where s.id = 1`,
+  );
+  return rows[0] ?? null;
+}
+
+export interface BridgeDepositRow {
+  tx_hash: string;
+  log_index: number;
+  block_number: string;
+  ts: Date;
+  address: string;
+  usdc: number;
+}
+
+export async function recentBridgeDeposits(windowMs: number, minUsd: number, limit: number): Promise<BridgeDepositRow[]> {
+  const { rows } = await pool.query<BridgeDepositRow>(
+    `select tx_hash, log_index, block_number, ts, address, usdc from bridge_deposits
+     where ts > now() - make_interval(secs => $1) and usdc >= $2
+     order by ts desc, log_index desc limit $3`,
+    [windowMs / 1000, minUsd, limit],
+  );
+  return rows;
+}
+
+export interface WhaleRow {
+  address: string;
+  deposited_usd: number; // sum over the requested window
+  n_deposits: number;
+  first_at: Date; // earliest deposit in the requested window
+  last_at: Date;
+  has_position: boolean; // live: any szi <> 0 in the positions ledger
+  flagged_at: Date | null;
+  watch_until: Date | null;
+  account_value: number | null;
+  total_ntl_pos: number | null;
+  state_checked_at: Date | null;
+  ledger_first_at: Date | null;
+  ledger_checked_at: Date | null;
+  first_trade_at: Date | null;
+  positioned_at: Date | null;
+}
+
+// Addresses whose bridge deposits in the trailing window total at least minUsd,
+// joined with whatever the watcher has learned about them on Hyperliquid.
+// `positioned` filters on live open positions; `newOnly` keeps accounts whose
+// first-ever ledger entry falls inside this deposit episode (brand-new wallets).
+export async function whaleWallets(
+  windowMs: number,
+  minUsd: number,
+  positioned: boolean | null,
+  newOnly: boolean,
+  limit: number,
+): Promise<WhaleRow[]> {
+  const { rows } = await pool.query<WhaleRow>(
+    `with dep as (
+       select address, sum(usdc) as usd, count(*)::int as n, min(ts) as first_at, max(ts) as last_at
+       from bridge_deposits
+       where ts > now() - make_interval(secs => $1)
+       group by address having sum(usdc) >= $2
+     ), joined as (
+       select dep.address, dep.usd as deposited_usd, dep.n as n_deposits, dep.first_at, dep.last_at,
+              exists (select 1 from positions p where p.address = dep.address and p.szi <> 0) as has_position,
+              w.flagged_at, w.watch_until, w.account_value, w.total_ntl_pos, w.state_checked_at,
+              w.ledger_first_at, w.ledger_checked_at, w.first_trade_at, w.positioned_at
+       from dep left join whale_wallets w on w.address = dep.address
+     )
+     select * from joined
+     where ($3::boolean is null or has_position = $3)
+       and (not $4::boolean or (ledger_first_at is not null and ledger_first_at >= first_at - interval '10 minutes'))
+     order by deposited_usd desc, last_at desc
+     limit $5`,
+    [windowMs / 1000, minUsd, positioned, newOnly, limit],
+  );
+  return rows;
+}
+
+export interface WalletPositionRow {
+  address: string;
+  coin: string;
+  szi: number;
+  entry_px: number | null;
+  updated_at: Date;
+}
+
+export async function openPositionsFor(addresses: string[]): Promise<WalletPositionRow[]> {
+  if (addresses.length === 0) return [];
+  const { rows } = await pool.query<WalletPositionRow>(
+    `select address, coin, szi, entry_px, updated_at from positions
+     where address = any($1::text[]) and szi <> 0
+     order by address, abs(szi) desc`,
+    [addresses],
+  );
+  return rows;
+}

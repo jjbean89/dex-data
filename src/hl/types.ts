@@ -45,7 +45,8 @@ export interface AssetPosition {
 
 export interface ClearinghouseState {
   assetPositions: AssetPosition[];
-  marginSummary?: { accountValue: string; totalNtlPos: string };
+  marginSummary?: { accountValue: string; totalNtlPos: string; totalRawUsd?: string; totalMarginUsed?: string };
+  withdrawable?: string;
   time: number;
 }
 
@@ -67,6 +68,19 @@ export interface UserFill {
     liquidatedUser?: string;
     markPx: string;
     method: "market" | "backstop";
+  };
+}
+
+// One entry from userNonFundingLedgerUpdates: deposits, withdrawals, and
+// transfers (internal, sub-account, spot, vault). Oldest first from startTime.
+// `usdc` is present on the USDC-denominated types (deposit, withdraw, transfers).
+export interface LedgerUpdate {
+  time: number;
+  hash: string;
+  delta: {
+    type: string; // "deposit" | "withdraw" | "internalTransfer" | "subAccountTransfer" | "accountClassTransfer" | "spotTransfer" | "vaultDeposit" | ...
+    usdc?: string;
+    [k: string]: unknown;
   };
 }
 
