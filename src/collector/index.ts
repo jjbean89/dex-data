@@ -1,6 +1,7 @@
 import { config } from "../config.js";
 import { sleep } from "../hl/client.js";
 import { log, logErr } from "../log.js";
+import { startLiqAlerts } from "./alerts.js";
 import { EMA_SWEEP_LAG_MS, syncEmas } from "./emas.js";
 import { syncFunding } from "./funding.js";
 import { startLiquidationsRecorder } from "./liquidations.js";
@@ -161,9 +162,12 @@ export function startCollector(): () => Promise<void> {
   const stops: Array<() => Promise<void>> = [];
   if (tape && config.positionsEnabled) stops.push(startPositionsTracker(isStopped, tape));
   if (tape && config.liquidationsEnabled) stops.push(startLiquidationsRecorder(isStopped, tape));
+  if (config.liquidationsEnabled && config.liqAlertsEnabled && config.liqAlertRules.length > 0) {
+    stops.push(startLiqAlerts(isStopped));
+  }
   log(
     "collector",
-    `started: poll ${config.pollIntervalMs}ms, funding sweep every ${Math.round(config.fundingSyncIntervalMs / 60_000)}min, backfill ${config.fundingBackfillDays}d, positions ${config.positionsEnabled ? "on" : "off"}, liquidations ${config.liquidationsEnabled ? "on" : "off"}, emas ${config.emasEnabled ? `${config.emaPeriods.join("/")} × ${config.emaTimeframes.join("/")}` : "off"}`,
+    `started: poll ${config.pollIntervalMs}ms, funding sweep every ${Math.round(config.fundingSyncIntervalMs / 60_000)}min, backfill ${config.fundingBackfillDays}d, positions ${config.positionsEnabled ? "on" : "off"}, liquidations ${config.liquidationsEnabled ? "on" : "off"}, liq alerts ${config.liquidationsEnabled && config.liqAlertsEnabled ? `${config.liqAlertRules.length} rules` : "off"}, emas ${config.emasEnabled ? `${config.emaPeriods.join("/")} × ${config.emaTimeframes.join("/")}` : "off"}`,
   );
 
   return async () => {

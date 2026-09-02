@@ -1,5 +1,6 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
-import { EMA_TF_MS, config } from "../config.js";
+import { EMA_TF_MS, config, type LiqAlertSide } from "../config.js";
+import { liqWindowTotals, listLiqAlerts, loadLiqAlertRules, sideSlice, type LiqAlertRow, type LiqAlertRuleRow } from "../db/liq-alerts.js";
 import { pool } from "../db/pool.js";
 import {
   LATEST_MAX_AGE_MS,
@@ -244,6 +245,33 @@ function serializeLiqFill(r: LiqFillRow, includeCoin: boolean): Record<string, u
   };
 }
 
+function parseAlertSide(raw: string | undefined): LiqAlertSide | undefined | null {
+  if (raw === undefined || raw === "") return undefined;
+  return raw === "long" || raw === "short" || raw === "total" ? raw : null;
+}
+
+function serializeAlert(r: LiqAlertRow): Record<string, unknown> {
+  return {
+    id: r.id,
+    t: r.ts.toISOString(),
+    tMs: r.ts.getTime(),
+    coin: r.coin,
+    window: r.win,
+    side: r.side,
+    ntlUsd: r.ntl_usd,
+    thresholdUsd: r.threshold_usd,
+    pctOfThreshold: r.threshold_usd > 0 ? (r.ntl_usd / r.threshold_usd) * 100 : null,
+    events: r.events,
+    fills: r.fills,
+    longs: { ntlUsd: r.long_ntl, events: r.long_events },
+    shorts: { ntlUsd: r.short_ntl, events: r.short_events },
+    totalNtlUsd: r.long_ntl + r.short_ntl,
+    message: r.message,
+    delivered: r.delivered,
+    deliveryError: r.delivery_error,
+  };
+}
+
 // Windows for the liquidation board/summaries: raw-fill exact, so bounded by the
 // liq_fills retention rather than tick retention.
 function parseLiqWindows(raw: string | undefined, reply: FastifyReply): Array<{ name: string; ms: number }> | null {
@@ -415,8 +443,84 @@ export function registerRoutes(app: FastifyInstance): void {
       "GET /v1/market/funding?interval=1h&smooth=8h&from=&to=&limit=300",
       "GET /v1/market/liquidations?interval=5m|15m|1h|4h|12h|1d&from=&to=&limit=300",
       "GET /v1/market/liquidations/recent?limit=50",
+      "GET /v1/alerts?coin=&window=&side=long|short|total&since=&limit=100",
+      "GET /v1/alerts/rules",
     ],
   }));
+
+  // Liquidation threshold alerts fired by the collector (see LIQ_ALERT_RULES),
+  // newest first. Every alert is one threshold crossing of one rule.
+  app.get("/v1/alerts", async (req, reply) => {
+    const q = req.query as Query;
+    const limit = parseLimit(q.limit, 100, 1000);
+    if (limit === null) return bad(reply, "invalid limit");
+    const since = parseTimeMs(q.since);
+    if (since === null) return bad(reply, "invalid since — use epoch ms, epoch seconds, or an ISO timestamp");
+    const side = parseAlertSide(q.side);
+    if (side === null) return bad(reply, `invalid side "${q.side}" — use long|short|total`);
+    let coin: string | undefined;
+    if (q.coin !== undefined && q.coin !== "") {
+      const asset = await resolveCoin(q.coin);
+      coin = asset ? asset.coin : q.coin; // unknown names still filter (they just match nothing)
+    }
+    if (q.window !== undefined && q.window !== "" && parseWindow(q.window) === null) {
+      return bad(reply, `invalid window "${q.window}" — use e.g. 15m, 1h, 24h`);
+    }
+    const rows = await listLiqAlerts({
+      ...(coin !== undefined ? { coin } : {}),
+      ...(q.window ? { win: q.window } : {}),
+      ...(side !== undefined ? { side } : {}),
+      ...(since !== undefined ? { sinceMs: since } : {}),
+      limit,
+    });
+    return { count: rows.length, data: rows.map(serializeAlert) };
+  });
+
+  // The configured rules with their live window values and armed state: the
+  // "alert board" — how close each coin is to its next alert.
+  app.get("/v1/alerts/rules", async () => {
+    const rules = await cached("alerts:rules", CACHE_MS, async () => {
+      const rows = await loadLiqAlertRules();
+      const byCoin = new Map<string, LiqAlertRuleRow[]>();
+      for (const r of rows) {
+        let list = byCoin.get(r.coin);
+        if (!list) byCoin.set(r.coin, (list = []));
+        list.push(r);
+      }
+      const out: Array<Record<string, unknown>> = [];
+      for (const [coin, coinRules] of byCoin) {
+        const totals = await liqWindowTotals(
+          coin,
+          coinRules.map((r) => Number(r.window_ms)),
+        );
+        for (const r of coinRules) {
+          const t = totals.get(Number(r.window_ms));
+          const slice = t ? sideSlice(t, r.side) : { ntl: 0, events: 0, fills: 0 };
+          out.push({
+            coin: r.coin,
+            window: r.win,
+            side: r.side,
+            thresholdUsd: r.threshold_usd,
+            current: { ntlUsd: slice.ntl, events: slice.events, fills: slice.fills },
+            pctOfThreshold: r.threshold_usd > 0 ? (slice.ntl / r.threshold_usd) * 100 : null,
+            active: r.active,
+            lastEvalAt: r.last_eval_at ? r.last_eval_at.toISOString() : null,
+            lastFiredAt: r.last_fired_at ? r.last_fired_at.toISOString() : null,
+          });
+        }
+      }
+      return out;
+    });
+    const evalAts = rules.map((r) => r.lastEvalAt as string | null).filter((t): t is string => t !== null);
+    const lastEval = evalAts.length > 0 ? evalAts.sort().at(-1)! : null;
+    return {
+      asOf: new Date().toISOString(),
+      lastEvalAt: lastEval,
+      evaluatorStale: lastEval === null || Date.now() - Date.parse(lastEval) > 5 * 60_000,
+      count: rules.length,
+      rules,
+    };
+  });
 
   // Seed pipeline diagnostics: import progress plus the collector's recent
   // operational events, so failures are debuggable without host log access.
