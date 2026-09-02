@@ -13,7 +13,7 @@ Custom Hyperliquid market data service. Hyperliquid's public API only exposes th
 - **Volume bars for every coin** — per-bar notional from the public trade tape (1m/5m/1h), split by taker side with TWAP flow flagged; Hyperliquid only exposes a rolling 24h number, so like OI this exists only if you record it
 - **Volume-leading-price signals** — abnormal volume while price is still flat, confirmed by open-interest growth or one-sided taker flow: the accumulation that precedes a move, with breakout confirmation after the fact
 - **EMAs for every coin on every timeframe** — EMA 21/200 on 1h/4h/12h/1d (all configurable), seeded from full candle history to match TradingView, plus the screener columns derived from them (price-vs-EMA %, EMA-vs-EMA cross spread) in one response
-- **New whale wallets** — every wallet that bridged $1M+ (configurable) into Hyperliquid in the last hour, whether the account is brand new, and whether it has opened a position yet (with the positions) — from the Arbitrum bridge's deposit logs joined to per-wallet Hyperliquid state; Hyperliquid's own API has no deposit feed at all. Each new whale, and its first position, can be pushed to Discord/Slack
+- **New whale wallets** — every wallet that bridged $1M+ (configurable) into Hyperliquid in the last hour, whether the account is brand new, and whether it has opened a position since (with the positions, and which of them were held before the money arrived) — from the Arbitrum bridge's deposit logs joined to per-wallet Hyperliquid state; Hyperliquid's own API has no deposit feed at all. Each new whale, and the first large position it opens after funding, can be pushed to Discord/Slack
 
 One process polls `metaAndAssetCtxs` (every live perp in a single request) every 15s, rolls ticks up into 5m/1h candles, prunes raw data on a retention schedule, runs the trades-WebSocket position tracker, and polls the Arbitrum bridge for incoming deposits. A second process serves a read-only JSON API.
 
@@ -119,7 +119,8 @@ Deploys are zero-drama: the collector shuts down gracefully on SIGTERM and the D
 | `BRIDGE_POLL_MS` / `BRIDGE_CONFIRMATIONS` | `15000` / `10` | Poll cadence; blocks behind head to scan (reorg guard) |
 | `BRIDGE_BACKFILL_HOURS` / `BRIDGE_MIN_RECORD_USD` / `BRIDGE_RETENTION_DAYS` | `6` / `1000` / `90` | First-boot scan depth; smallest deposit recorded; raw deposit retention |
 | `WHALE_MIN_USD` / `WHALE_WINDOW_HOURS` | `1000000` / `1` | Flag a wallet when its deposits over the trailing window reach this |
-| `WHALE_WATCH_HOURS` / `WHALE_WATCH_POLL_MS` | `24` / `60000` | How long, and how often, a flagged wallet is polled on HL for its first position |
+| `WHALE_WATCH_HOURS` / `WHALE_WATCH_POLL_MS` | `24` / `60000` | How long, and how often, a flagged wallet is polled on HL for a position opened after funding |
+| `WHALE_POSITION_MIN_USD` | `1000000` | The `positioned` alert needs this much notional in positions opened after funding (new coins or side flips vs. what the wallet held at its first deposit; adding to an existing position never counts); `0` = any size |
 | `WHALE_ALERT_EVENTS` | `funded,positioned` | Which whale events to push to `LIQ_ALERT_WEBHOOK_URL` (shared with the liquidation alerts) |
 | `HYPERTRACKER_API_KEY` | — | Enables the one-time starting-census import (see positioning docs below) |
 | `HYPERTRACKER_BASE_URL` / `HYPERTRACKER_REQ_DELAY_MS` | `https://ht-api.coinmarketman.com/api` / `1500` | Census source + pacing |
@@ -325,7 +326,7 @@ Semantics:
 - **Late discovery still counts.** The tracker keys on when fills were recorded, not when they traded, so liquidations the recorder classifies late or backfills after downtime are collected too (a burst older than the window is recorded already closed).
 - Wallets are public on-chain addresses; `explorer` links to Hyperliquid's own explorer. Totals are the recorder's floors (see coverage notes above) — a large liquidation is exactly the flow the verification queue prioritises, so these are caught reliably in practice.
 ### `GET /v1/whales/new?window=1h&minUsd=1000000`
-**New whale wallets**: every address whose deposits into Hyperliquid over the trailing window total at least `minUsd`, with what the tracker has learned about each on Hyperliquid — account value, account age, when it first traded, and its open positions marked at the live price. Params: `window` (`1m`…`{BRIDGE_RETENTION_DAYS}d`, default `1h`), `minUsd` (default `WHALE_MIN_USD`), `positioned` (`true` = only wallets with an open position right now, `false` = only funded-but-idle ones), `newOnly=true` (only brand-new accounts — first ledger entry ever is inside this deposit episode), `limit`. Sorted by deposited amount.
+**New whale wallets**: every address whose deposits into Hyperliquid over the trailing window total at least `minUsd`, with what the tracker has learned about each on Hyperliquid — account value, account age, when it first traded, and its open positions marked at the live price, each flagged `openedAfterFunding` (not held, or held the other way, when this episode's first deposit landed; `null` until the tracker's first check). `positionedAt` is the first time such a position was seen. Params: `window` (`1m`…`{BRIDGE_RETENTION_DAYS}d`, default `1h`), `minUsd` (default `WHALE_MIN_USD`), `positioned` (`true` = only wallets with an open position right now, `false` = only funded-but-idle ones), `newOnly=true` (only brand-new accounts — first ledger entry ever is inside this deposit episode), `limit`. Sorted by deposited amount.
 
 ```json
 { "window": "1h", "minUsd": 1000000, "asOf": "2026-09-02T15:40:12.001Z",
@@ -339,12 +340,12 @@ Semantics:
              "firstTradeAt": "2026-09-02T15:11:08.416Z", "positionedAt": "2026-09-02T15:11:08.416Z", "hasOpenPosition": true,
              "openNtlUsd": 7400000.0,
              "positions": [{ "coin": "BTC", "side": "long", "sz": 95.2, "ntlUsd": 7400000.0, "entryPx": 77510.0, "markPx": 77731.1,
-                             "unrealizedPnlUsd": 21048.7, "updatedAt": "2026-09-02T15:39:31.204Z" }] }] }
+                             "unrealizedPnlUsd": 21048.7, "openedAfterFunding": true, "updatedAt": "2026-09-02T15:39:31.204Z" }] }] }
 ```
 
 How this works — Hyperliquid's API cannot answer this question by itself:
 - **Every account endpoint on Hyperliquid is keyed by wallet** (the deposit ledger included) and the WebSocket's only global channels are market data, so there is nothing to poll or subscribe to for "who just got funded". But external money enters through the **Bridge2 contract on Arbitrum** as a plain USDC transfer whose *sender is the Hyperliquid account credited* (the app's gas-free path uses a permit; the Transfer event is still user → bridge). One `eth_getLogs` filter on the USDC contract with the bridge as recipient is therefore a complete, real-time feed of external deposits. The collector polls it every 15s from a stored block cursor (chunked, with the chunk size adapting to whatever cap the RPC enforces), records deposits ≥ `BRIDGE_MIN_RECORD_USD`, and flags any address whose deposits over the trailing `WHALE_WINDOW_HOURS` reach `WHALE_MIN_USD`. Downtime heals itself: the cursor resumes where it stopped (up to 7 days back).
-- **Flagged wallets are then watched on Hyperliquid.** One `clearinghouseState` (weight 2) per poll captures account value and open positions until the first position appears, then every 15 minutes for `WHALE_WATCH_HOURS`. The first check also reads the wallet's ledger from time zero (`userNonFundingLedgerUpdates`) — its first entry is the account's age, which is what `isNewAccount` and `accountAgeDays` report: a brand-new whale versus a known one topping up. If the trade tape is on, a watched wallet's first fill is caught the moment it prints (both parties of every fill are on the public tape) and triggers an immediate state refresh — `firstTradeAt` is exact to the fill, at zero API cost.
+- **Flagged wallets are then watched on Hyperliquid.** One `clearinghouseState` (weight 2) per poll captures account value and open positions until a large position opened after funding appears (the `positioned` alert), then every 15 minutes for `WHALE_WATCH_HOURS`. The first check also reads the wallet's ledger from time zero (`userNonFundingLedgerUpdates`) — its first entry is the account's age, which is what `isNewAccount` and `accountAgeDays` report: a brand-new whale versus a known one topping up — and reconstructs what the wallet held *before* the deposit: its current positions with every fill since the first deposit unwound (one `userFillsByTime`). That baseline is what separates a new position from a top-up: a known account adding to thirty open shorts is not news, the same account opening a fresh one is. If the trade tape is on, a watched wallet's first fill is caught the moment it prints (both parties of every fill are on the public tape) and triggers an immediate state refresh — `firstTradeAt` is exact to the fill, at zero API cost.
 - `positioned` filters on the **live** positions ledger (a wallet that opened and closed reads `false` with `positionedAt` set); the positions listed come from the same ledger the long/short tracker maintains, so they stay current from fills after the first check. `openNtlUsd` and `ntlUsd` are marked at the latest tick.
 - **What it misses, honestly:** money that never touches Arbitrum — transfers between Hyperliquid accounts, sub-account funding, HyperEVM→Core moves — and native-asset deposits through Hyperunit (those land as spot BTC/ETH/SOL, not USDC margin). A new wallet funded from an existing whale's Hyperliquid account is invisible here. A deposit routed through a contract that forwards funds could credit an address other than the transfer sender; the tracker records the sender.
 - Requests: the bridge watcher costs ~8 RPC calls per minute (head + logs per poll) plus one batched block lookup per poll that found deposits; whale polling is a handful of weight-2 calls per minute at most.
@@ -353,13 +354,14 @@ How this works — Hyperliquid's API cannot answer this question by itself:
 **Whale alerts** — the push feed behind the board. Two events per whale episode, each sent once (state survives restarts):
 
 - `funded` — a wallet crossed `WHALE_MIN_USD`. Sent right after the tracker's first Hyperliquid check, so it already says whether the account is brand new and what its perps account is worth.
-- `positioned` — a flagged wallet was first seen with an open position: the largest positions with side, notional and entry, total notional, and account value.
+- `positioned` — a flagged wallet opened a position it did not hold when it was funded: a new coin, or a side flip, never an addition to an existing position. Sent once per episode, the first time such positions add up to `WHALE_POSITION_MIN_USD` of notional, with those positions (side, notional, entry), how many positions the wallet already held before funding, total notional, and account value.
 
-Every alert is logged (`[whales] ALERT …`), stored, and — with `LIQ_ALERT_WEBHOOK_URL` set, the same webhook the liquidation alerts use — POSTed. Discord and Slack incoming-webhook URLs are auto-detected and receive a one-line message ending in the wallet's explorer link; anything else gets `{type: "whale_funded" | "whale_positioned", alert: {…}}` with the structured fields. Delivery is retried, and the stored row records `delivered` / `deliveryError`. `WHALE_ALERT_EVENTS` narrows which events are sent. Params: `kind`, `address`, `since` (epoch ms/s or ISO), `limit` (default 100, max 1000).
+Every alert is logged (`[whales] ALERT …`), stored, and — with `LIQ_ALERT_WEBHOOK_URL` set, the same webhook the liquidation alerts use — POSTed. Discord and Slack incoming-webhook URLs are auto-detected and receive a one-line message ending in the wallet's explorer link; anything else gets `{type: "whale_funded" | "whale_positioned", alert: {…}}` with the structured fields (`opened` lists the newly opened positions, `positions` the wallet's whole book). Delivery is retried, and the stored row records `delivered` / `deliveryError`. `WHALE_ALERT_EVENTS` narrows which events are sent. Params: `kind`, `address`, `since` (epoch ms/s or ISO), `limit` (default 100, max 1000).
 
 ```
 🐋 New whale funded: 0x9a3c…e41b bridged $2.50M into Hyperliquid in several deposits (latest 2 min ago) — brand-new account (first activity 4 min ago), perps account $2.50M. https://app.hyperliquid.xyz/explorer/address/0x9a3c…
-🐋 Whale opened a position: 0x9a3c…e41b long BTC $7.40M @ 77510 — $7.40M total notional, account $2.50M. Bridged $2.50M 9 min ago, brand-new account (first activity 11 min ago). https://app.hyperliquid.xyz/explorer/address/0x9a3c…
+🐋 Whale opened a new position: 0x9a3c…e41b long BTC $7.40M @ 77510 — $7.40M newly opened, $7.40M total notional, account $2.50M. Bridged $2.50M 9 min ago, brand-new account (first activity 11 min ago). https://app.hyperliquid.xyz/explorer/address/0x9a3c…
+🐋 Whale opened a new position: 0x7fda…17d1 long HYPE $3.10M @ 41.2 — $3.10M newly opened on top of 32 positions held before funding, $155.97M total notional, account $42.49M. Bridged $2.00M 31 min ago, account 24mo old. https://app.hyperliquid.xyz/explorer/address/0x7fda…
 ```
 
 ```json
@@ -368,7 +370,8 @@ Every alert is logged (`[whales] ALERT …`), stored, and — with `LIQ_ALERT_WE
              "depositedUsd": 2500000, "accountValueUsd": 2498120.4, "totalNtlPosUsd": 7400000.0,
              "isNewAccount": true, "ledgerFirstAt": "2026-09-02T15:02:11.000Z",
              "positions": [{ "coin": "BTC", "side": "long", "sz": 95.2, "entryPx": 77510.0 }],
-             "message": "Whale opened a position: …", "delivered": true, "deliveryError": null }] }
+             "opened": [{ "coin": "BTC", "side": "long", "sz": 95.2, "entryPx": 77510.0, "ntlUsd": 7400000.0 }],
+             "message": "Whale opened a new position: …", "delivered": true, "deliveryError": null }] }
 ```
 
 ### `GET /v1/bridge/deposits?window=24h&minUsd=100000`

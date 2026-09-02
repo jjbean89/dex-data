@@ -605,6 +605,7 @@ export interface WhaleRow {
   ledger_checked_at: Date | null;
   first_trade_at: Date | null;
   positioned_at: Date | null;
+  baseline_positions: Array<{ coin: string; szi: number }> | null;
 }
 
 // Addresses whose bridge deposits in the trailing window total at least minUsd,
@@ -628,7 +629,7 @@ export async function whaleWallets(
        select dep.address, dep.usd as deposited_usd, dep.n as n_deposits, dep.first_at, dep.last_at,
               exists (select 1 from positions p where p.address = dep.address and p.szi <> 0) as has_position,
               w.flagged_at, w.watch_until, w.account_value, w.total_ntl_pos, w.state_checked_at,
-              w.ledger_first_at, w.ledger_checked_at, w.first_trade_at, w.positioned_at
+              w.ledger_first_at, w.ledger_checked_at, w.first_trade_at, w.positioned_at, w.baseline_positions
        from dep left join whale_wallets w on w.address = dep.address
      )
      select * from joined
@@ -671,6 +672,7 @@ export interface WhaleAlertRow {
   is_new_account: boolean | null;
   ledger_first_at: Date | null;
   positions: Array<{ coin: string; side: string; sz: number; entryPx: number | null }>;
+  opened: Array<{ coin: string; side: string; sz: number; entryPx: number | null; ntlUsd: number }>;
   message: string;
   delivered: boolean | null;
   delivery_error: string | null;
@@ -679,7 +681,7 @@ export interface WhaleAlertRow {
 export async function listWhaleAlerts(f: { kind?: string; address?: string; sinceMs?: number; limit: number }): Promise<WhaleAlertRow[]> {
   const { rows } = await pool.query<WhaleAlertRow>(
     `select id, ts, kind, address, deposited_usd, account_value, total_ntl_pos, is_new_account, ledger_first_at,
-            positions, message, delivered, delivery_error
+            positions, opened, message, delivered, delivery_error
      from whale_alerts
      where ($1::text is null or kind = $1)
        and ($2::text is null or address = $2)
