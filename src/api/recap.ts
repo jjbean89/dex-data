@@ -1,4 +1,3 @@
-import { formatUsd } from "../collector/webhook.js";
 import { pool } from "../db/pool.js";
 import { hl } from "../hl/client.js";
 import type { Candle } from "../hl/types.js";
@@ -17,15 +16,15 @@ import { aprPct, cached, pctChange } from "./util.js";
 
 // One-call "what happened to this coin" recap: liquidations by side, price change
 // with all-time-high detection, open-interest change with record-high detection,
-// and long/short trader deltas over a trailing window — plus a headline sentence
-// assembled from those numbers, so a ticker can be filled in from one request.
+// and long/short trader deltas over a trailing window — the numbers a ticker
+// line is written from, in one request.
 
 const DAY_MS = 86_400_000;
 const HL_CANDLE_CAP = 5_000; // HL retains ~5000 most recent candles per interval
 const ATH_CACHE_MS = 300_000; // one candleSnapshot (weight 20) per coin per 5min at most
 const RECORD_CACHE_MS = 60_000;
-const NEAR_PCT = 5; // "within X% of the record" mention threshold for the headline
-const DOMINANT_SHARE_PCT = 60; // one side owns the liquidation story above this share
+const NEAR_PCT = 5; // flags.nearAllTimeHigh threshold
+const DOMINANT_SHARE_PCT = 60; // dominantSide names one side above this share of liquidated notional
 
 // ---- Recorded extremes (our own candles) ----
 
@@ -337,23 +336,6 @@ export async function buildRecap(asset: AssetRow, windowName: string, windowMs: 
     longsIncreased: longsChangePct !== null ? longsChangePct > 0 : null,
   };
 
-  const headline = buildHeadline({
-    coin,
-    windowName,
-    px: tick.px,
-    pxChangePct,
-    ath,
-    oiUsd: tick.oi_usd,
-    oiChangePct: openInterest.changePct,
-    oiRecordHigh,
-    oiPctBelowRecord: openInterest.record.pctBelowRecord,
-    longNtl,
-    shortNtl,
-    dominantSide,
-    nLong: posNow?.n_long ?? null,
-    nLongThen: posThen?.n_long ?? null,
-    longsChangePct,
-  });
 
   return {
     ok: true,
@@ -364,7 +346,6 @@ export async function buildRecap(asset: AssetRow, windowName: string, windowMs: 
       from: new Date(windowStartMs).toISOString(),
       to: tick.ts.toISOString(),
       asOf: tick.ts.toISOString(),
-      headline,
       flags,
       price,
       openInterest,
@@ -386,102 +367,4 @@ function maxWithLive(h: number | null, hAt: Date | null, live: number | null, li
   if (h === null && live === null) return null;
   if (h === null || (live !== null && live > h)) return { px: live!, at: liveAt.toISOString() };
   return { px: h, at: hAt ? hAt.toISOString() : liveAt.toISOString() };
-}
-
-// ---- Headline ----
-
-interface HeadlineInput {
-  coin: string;
-  windowName: string;
-  px: number | null;
-  pxChangePct: number | null;
-  ath: AthBlock | null;
-  oiUsd: number | null;
-  oiChangePct: number | null;
-  oiRecordHigh: boolean;
-  oiPctBelowRecord: number | null;
-  longNtl: number;
-  shortNtl: number;
-  dominantSide: "shorts" | "longs" | "balanced" | "none";
-  nLong: number | null;
-  nLongThen: number | null;
-  longsChangePct: number | null;
-}
-
-// formatUsd without the trailing zeros ("$520M", "$2.46M", "$2.89B") for prose.
-const fmtUsd = (n: number): string => formatUsd(n).replace(/\.?0+([kMB])$/, "$1");
-
-export function formatPx(px: number): string {
-  if (px >= 1000) return px.toLocaleString("en-US", { maximumFractionDigits: 0 });
-  if (px >= 1) return px.toFixed(2);
-  return px.toPrecision(4).replace(/\.?0+$/, "");
-}
-
-const signedPct = (p: number, digits = 1): string => `${p >= 0 ? "+" : ""}${p.toFixed(digits)}%`;
-const absPct = (p: number, digits = 1): string => `${Math.abs(p).toFixed(digits)}%`;
-
-function windowPhrase(name: string): string {
-  const m = /^(\d+)(m|h|d)$/.exec(name);
-  if (!m) return name;
-  const n = parseInt(m[1]!, 10);
-  const unit = m[2] === "m" ? "minute" : m[2] === "h" ? "hour" : "day";
-  if (n === 24 && unit === "hour") return "24 hours";
-  return `${n} ${unit}${n === 1 ? "" : "s"}`;
-}
-
-export function buildHeadline(i: HeadlineInput): string {
-  const { coin } = i;
-  const total = i.longNtl + i.shortNtl;
-
-  let liq: string;
-  if (i.dominantSide === "none") liq = `no ${coin} positions were liquidated`;
-  else if (i.dominantSide === "shorts") liq = `${fmtUsd(i.shortNtl)} of ${coin} shorts were liquidated`;
-  else if (i.dominantSide === "longs") liq = `${fmtUsd(i.longNtl)} of ${coin} longs were liquidated`;
-  else liq = `${fmtUsd(total)} of ${coin} positions were liquidated (${fmtUsd(i.longNtl)} longs, ${fmtUsd(i.shortNtl)} shorts)`;
-
-  let price: string;
-  const pxStr = i.px !== null ? `$${formatPx(i.px)}` : null;
-  const chg = i.pxChangePct !== null ? ` (${signedPct(i.pxChangePct)})` : "";
-  if (i.ath?.isNewInWindow) {
-    price = `price broke to a new all-time high${pxStr ? ` of ${pxStr}` : ""}${chg}`;
-  } else if (i.pxChangePct !== null && pxStr) {
-    const near = i.ath && i.ath.pctBelowAth !== null && i.ath.pctBelowAth <= NEAR_PCT ? `, within ${absPct(i.ath.pctBelowAth)} of its all-time high` : "";
-    price =
-      Math.abs(i.pxChangePct) < 0.05
-        ? `price held flat at ${pxStr}${near}`
-        : `price ${i.pxChangePct > 0 ? "climbed" : "fell"} ${absPct(i.pxChangePct)} to ${pxStr}${near}`;
-  } else {
-    price = pxStr ? `price sits at ${pxStr}` : "price data is still warming up";
-  }
-  const first = `In the past ${windowPhrase(i.windowName)}, ${liq} as ${price}.`;
-
-  const parts: string[] = [];
-  if (i.longsChangePct !== null && i.nLong !== null && i.nLongThen !== null) {
-    const dir = i.longsChangePct > 0 ? "increased" : i.longsChangePct < 0 ? "decreased" : "held flat";
-    parts.push(
-      i.longsChangePct === 0
-        ? `${coin} longs held flat at ${i.nLong.toLocaleString("en-US")} traders`
-        : `${coin} longs ${dir} by ${absPct(i.longsChangePct)} (${i.nLongThen.toLocaleString("en-US")} → ${i.nLong.toLocaleString("en-US")} traders)`,
-    );
-  }
-  if (i.oiUsd !== null) {
-    const oiChg = i.oiChangePct !== null ? `, ${signedPct(i.oiChangePct)}` : "";
-    if (i.oiRecordHigh) {
-      parts.push(`open interest reached its highest level ever recorded on Hyperliquid (${fmtUsd(i.oiUsd)}${oiChg})`);
-    } else if (i.oiChangePct !== null) {
-      const near = i.oiPctBelowRecord !== null && i.oiPctBelowRecord <= NEAR_PCT ? `, within ${absPct(i.oiPctBelowRecord)} of its record` : "";
-      parts.push(
-        Math.abs(i.oiChangePct) < 0.05
-          ? `open interest held flat at ${fmtUsd(i.oiUsd)}${near}`
-          : `open interest ${i.oiChangePct > 0 ? "grew" : "shrank"} ${absPct(i.oiChangePct)} to ${fmtUsd(i.oiUsd)}${near}`,
-      );
-    } else {
-      parts.push(`open interest stands at ${fmtUsd(i.oiUsd)}`);
-    }
-  }
-  if (parts.length === 0) return first;
-
-  const heavy = (i.longsChangePct ?? 0) > 0 && (i.oiChangePct ?? 0) >= NEAR_PCT;
-  const lead = heavy ? "Traders bet heavily as" : "Meanwhile,";
-  return `${first} ${lead} ${parts.join(" and ")}.`;
 }

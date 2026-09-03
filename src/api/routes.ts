@@ -1131,7 +1131,7 @@ export function registerRoutes(app: FastifyInstance): void {
 
   // The ticker recap: liquidations by side, price change + all-time-high check,
   // OI change + record-high check, and long/short trader deltas over one trailing
-  // window, with a headline sentence pre-written from those numbers.
+  // window — the numbers a ticker line is written from, in one request.
   app.get("/v1/perps/:coin/recap", async (req, reply) => {
     const { coin: coinRaw } = req.params as { coin: string };
     const asset = await resolveCoin(coinRaw);
