@@ -208,6 +208,27 @@ function positioningSummary(r: PositioningRow): Record<string, unknown> {
     ntlLongUsd: r.ntl_long,
     ntlShortUsd: r.ntl_short,
     source: r.source,
+    entries: entrySummary(r),
+  };
+}
+
+// Size-weighted average entry per side and how many positions with a known
+// entry are in profit at the snapshot's price. Null on pre-migration and
+// backfilled (hypertracker) rows, which carry no entry prices.
+function entrySummary(r: PositioningRow): Record<string, unknown> | null {
+  if (r.n_long_entry === null || r.n_short_entry === null) return null;
+  const longProfit = r.n_long_profit ?? 0;
+  const shortProfit = r.n_short_profit ?? 0;
+  return {
+    avgEntryLong: r.avg_entry_long,
+    avgEntryShort: r.avg_entry_short,
+    longsInProfit: longProfit,
+    longsUnderwater: r.n_long_entry - longProfit,
+    shortsInProfit: shortProfit,
+    shortsUnderwater: r.n_short_entry - shortProfit,
+    pctLongsInProfit: r.n_long_entry > 0 ? (longProfit / r.n_long_entry) * 100 : null,
+    pctShortsInProfit: r.n_short_entry > 0 ? (shortProfit / r.n_short_entry) * 100 : null,
+    withKnownEntry: { long: r.n_long_entry, short: r.n_short_entry },
   };
 }
 
@@ -322,6 +343,10 @@ export async function buildRecap(asset: AssetRow, windowName: string, windowMs: 
               typeof nowSum.pctLong === "number" && typeof thenSum?.pctLong === "number" ? nowSum.pctLong - thenSum.pctLong : null,
             ntlLongChangePct: pctChange(posNow.ntl_long, posThen.ntl_long),
             ntlShortChangePct: pctChange(posNow.ntl_short, posThen.ntl_short),
+            avgEntryLongDelta: posNow.avg_entry_long !== null && posThen.avg_entry_long !== null ? posNow.avg_entry_long - posThen.avg_entry_long : null,
+            avgEntryLongChangePct: pctChange(posNow.avg_entry_long, posThen.avg_entry_long),
+            avgEntryShortDelta: posNow.avg_entry_short !== null && posThen.avg_entry_short !== null ? posNow.avg_entry_short - posThen.avg_entry_short : null,
+            avgEntryShortChangePct: pctChange(posNow.avg_entry_short, posThen.avg_entry_short),
           }
         : null,
       coverage,

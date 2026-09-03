@@ -184,9 +184,13 @@ Universe list (sorted by OI) and a single-coin snapshot with `changes` for 1h/4h
   "liquidations": { "longs": { "ntlUsd": 199800, "events": 1, "fills": 1 }, "shorts": { "ntlUsd": 2461000, "events": 2, "fills": 3 },
                     "totalNtlUsd": 2660800, "events": 3, "shortSharePct": 92.5, "dominantSide": "shorts" },
   "positioning": { "nLong": 1140, "nShort": 760, "nTraders": 1900, "pctLong": 60.0, "ntlLongUsd": 300000000, "ntlShortUsd": 180000000,
-                   "then": { "nLong": 1000, "nShort": 800, "...": "same shape" },
+                   "entries": { "avgEntryLong": 812.4, "avgEntryShort": 941.7, "longsInProfit": 1102, "longsUnderwater": 38,
+                                "shortsInProfit": 12, "shortsUnderwater": 748, "pctLongsInProfit": 96.7, "pctShortsInProfit": 1.6,
+                                "withKnownEntry": { "long": 1140, "short": 760 } },
+                   "then": { "nLong": 1000, "nShort": 800, "entries": { "...": "same shape" }, "...": "same shape" },
                    "changes": { "nLongDelta": 140, "nLongChangePct": 14.0, "nShortDelta": -40, "nShortChangePct": -5.0,
-                                "pctLongDelta": 4.44, "ntlLongChangePct": 50.0, "ntlShortChangePct": 12.5 },
+                                "pctLongDelta": 4.44, "ntlLongChangePct": 50.0, "ntlShortChangePct": 12.5,
+                                "avgEntryLongDelta": 96.1, "avgEntryLongChangePct": 13.4, "avgEntryShortDelta": 154.2, "avgEntryShortChangePct": 19.6 },
                    "coverage": { "tracked": 9184, "pending": 1201, "provisional": 0 } },
   "funding": { "hr": 0.00003, "aprPct": 26.28, "hrThen": 0.00001 }, "dayNtlVlm": 1500000000, "maxLeverage": 10 }
 ```
@@ -196,7 +200,7 @@ Where each block comes from, and what the flags mean:
 - **`price` / `openInterest` change** — now vs. the recorded tick nearest `now − window`, identical to `/changes` (so `null` until the window has history). `windowHigh`/`windowLow` come from the 5m candles plus the live tick.
 - **`allTimeHigh`** — from Hyperliquid's own daily candles (the full listing history, fetched once per coin per 5 minutes; `null` if the fetch fails or the coin has no candles). `isNewInWindow` is true when a high above every prior high printed inside the window; the pre-window part of the day that straddles the window start is resolved from our 5m candles, so a window shorter than a day still gets a precise answer. `pctBelowAth` is the current price's distance from the high (`0` = at the high); `flags.nearAllTimeHigh` = within 5%.
 - **`openInterest.record`** — the highest OI **this service has recorded** (1h candles are kept forever, so the record deepens the longer the collector runs — `recordedSince`/`recordedDays` say how deep it is). `isRecordHigh` is true when that record was set inside the window — the "open interest reaches its highest level on Hyperliquid" claim.
-- **`positioning`** — the long/short trader counts now vs. the snapshot nearest `now − window`, with count and notional deltas (`nLongChangePct` is the "longs increased by X%" number). `null` while the tracker is warming up or when `POSITIONS_ENABLED=false`; `changes` is `null` when no snapshot exists that far back.
+- **`positioning`** — the long/short trader counts now vs. the snapshot nearest `now − window`, with count and notional deltas (`nLongChangePct` is the "longs increased by X%" number). `entries` carries the size-weighted average entry price per side and how many positions with a known entry are in profit at that snapshot's price (same fields as `/positioning`; `null` on backfilled rows), and `changes` adds the average-entry drift over the window — a rising long average entry with a stable count means late buyers, not a bigger crowd. `null` while the tracker is warming up or when `POSITIONS_ENABLED=false`; `changes` is `null` when no snapshot exists that far back.
 - **`flags`** — the booleans behind the usual claims (`newAllTimeHigh`, `nearAllTimeHigh`, `oiRecordHigh`, `liquidationsSide`, `longsIncreased`), `null` where the underlying block is. Change fields are `null` rather than fabricated when the window has no history yet, so check for `null` before writing a direction.
 
 ### `GET /v1/perps/:coin/candles?interval=5m|1h|1d`
