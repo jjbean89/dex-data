@@ -115,6 +115,14 @@ export async function changesBundle(windowMs: number): Promise<ChangesBundle> {
   return { asOf: asOf ? asOf.toISOString() : null, rows };
 }
 
+const CHANGES_CACHE_MS = 10_000;
+
+// Shared by every endpoint that needs "now vs N ago" for a window (the board and
+// the per-coin snapshot/recap) — one compute per window per cache tick.
+export function changesBundleCached(windowMs: number): Promise<ChangesBundle> {
+  return cached(`changes:${windowMs}`, CHANGES_CACHE_MS, () => changesBundle(windowMs));
+}
+
 export interface AssetRow {
   coin: string;
   sz_decimals: number | null;

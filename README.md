@@ -7,6 +7,7 @@ Custom Hyperliquid market data service. Hyperliquid's public API only exposes th
 - **Funding history** — settled hourly rates (synced from HL back to whatever backfill depth you choose) plus recorded live rates
 - **Venue-wide aggregates** — total OI candles and OI-weighted average funding, the "Aggregated Open Interest" / "Aggregated Funding Rate" style series
 - **Long/short trader counts** — how many wallets are long vs. short each coin, with change over time (derived from the public trade tape + per-wallet position tracking; this exists in no API anywhere)
+- **Ticker recap** — one call per coin that returns liquidations by side, price change with an all-time-high check, open-interest change with a record-high check, and long/short trader deltas over a window, plus a pre-written headline ("$2.46M of HYPE shorts were liquidated as price broke to a new all-time high…")
 - **Liquidations** — per-coin and venue-wide liquidation histograms (long vs. short notional, event counts) on any timeframe, trailing-window totals ("how much got liquidated in the last hour/day"), and a raw liquidation feed with wallets — reconstructed from public data; Hyperliquid publishes no liquidation feed at all
 - **Liquidation alerts** — threshold rules per coin × trailing window (15m / 1h / 24h) × side; one alert per crossing, persisted and queryable, optionally pushed to a webhook (Discord/Slack/JSON)
 - **Large liquidated accounts** — every wallet liquidated for more than a threshold ($10M by default) in one burst, with the per-coin breakdown, collected as it happens
@@ -164,7 +165,40 @@ Semantics worth knowing:
 - The collector seeds all coins within minutes of first boot (one paced candleSnapshot request per coin per timeframe), then stays current with ~1 hourly request per coin. New listings are picked up on the next hourly sweep; every coin is re-seeded from full history every `EMA_RESEED_DAYS` as a self-heal.
 
 ### `GET /v1/perps` · `GET /v1/perps/:coin`
-Universe list (sorted by OI) and a single-coin snapshot with `changes` for 1h/4h/24h inline. Coin names are matched case-insensitively (`btc` → `BTC`; exact match wins for names like `kPEPE`).
+Universe list (sorted by OI) and a single-coin snapshot with `changes` for 1h/4h/24h inline. Coin names are matched case-insensitively (`btc` → `BTC`; exact match wins for names like `kPEPE`). For the narrative version of the snapshot (liquidations, ATH, record OI, trader deltas, headline) see `/recap` below.
+
+### `GET /v1/perps/:coin/recap?window=24h`
+**The ticker recap in one call** — everything needed to write *"in the past 24 hours, $2.46M of HYPE shorts were liquidated as price broke to a new all-time high; traders bet heavily as HYPE longs increased by 14% and open interest reached its highest level on Hyperliquid"*: liquidations by side, price change with an all-time-high check, open-interest change with a record-high check, and long/short trader deltas over one trailing window, plus a `headline` sentence pre-written from those numbers. Params: `window` (`5m`…`14d`, rolling, default `24h`). Coin names are matched case-insensitively.
+
+```json
+{ "coin": "HYPE", "window": "24h", "from": "2026-09-02T18:47:34.646Z", "asOf": "2026-09-03T18:47:13.374Z",
+  "headline": "In the past 24 hours, $2.46M of HYPE shorts were liquidated as price broke to a new all-time high of $1,000 (+25.0%). Traders bet heavily as HYPE longs increased by 14.0% (1,000 → 1,140 traders) and open interest reached its highest level ever recorded on Hyperliquid ($520M, +30.0%).",
+  "flags": { "newAllTimeHigh": true, "nearAllTimeHigh": true, "oiRecordHigh": true, "liquidationsSide": "shorts", "longsIncreased": true },
+  "price": { "now": 1000, "then": 800, "changePct": 25.0, "changeAbs": 200, "hl24hChangePct": 25.0,
+             "windowHigh": { "px": 1010, "at": "2026-09-03T06:00:00.000Z" }, "windowLow": { "px": 790, "at": "..." },
+             "allTimeHigh": { "px": 1010, "at": "2026-09-03T06:00:00.000Z", "isNewInWindow": true, "priorAthPx": 720,
+                              "pctBelowAth": 0.99, "listedSince": "2024-12-05T00:00:00.000Z", "dailyCandles": 638, "source": "hl-daily-candles" } },
+  "openInterest": { "nowUsd": 520000000, "thenUsd": 400000000, "changeUsd": 120000000, "changePct": 30.0, "now": 520000,
+                    "windowHigh": { "usd": 530000000, "at": "..." }, "windowLow": { "usd": 390000000, "at": "..." },
+                    "record": { "usd": 530000000, "at": "2026-09-03T06:00:00.000Z", "coins": 700000, "coinsAt": "...",
+                                "isRecordHigh": true, "pctBelowRecord": 1.89, "recordedSince": "2026-08-24T18:00:00.000Z", "recordedDays": 10 } },
+  "liquidations": { "longs": { "ntlUsd": 199800, "events": 1, "fills": 1 }, "shorts": { "ntlUsd": 2461000, "events": 2, "fills": 3 },
+                    "totalNtlUsd": 2660800, "events": 3, "shortSharePct": 92.5, "dominantSide": "shorts" },
+  "positioning": { "nLong": 1140, "nShort": 760, "nTraders": 1900, "pctLong": 60.0, "ntlLongUsd": 300000000, "ntlShortUsd": 180000000,
+                   "then": { "nLong": 1000, "nShort": 800, "...": "same shape" },
+                   "changes": { "nLongDelta": 140, "nLongChangePct": 14.0, "nShortDelta": -40, "nShortChangePct": -5.0,
+                                "pctLongDelta": 4.44, "ntlLongChangePct": 50.0, "ntlShortChangePct": 12.5 },
+                   "coverage": { "tracked": 9184, "pending": 1201, "provisional": 0 } },
+  "funding": { "hr": 0.00003, "aprPct": 26.28, "hrThen": 0.00001 }, "dayNtlVlm": 1500000000, "maxLeverage": 10 }
+```
+
+Where each block comes from, and what the flags mean:
+- **`liquidations`** — exact trailing-window totals from raw fills (same numbers as `/v1/perps/liquidations`). `dominantSide` is `shorts`/`longs` when one side is ≥ 60% of liquidated notional, else `balanced` (`none` when nothing was liquidated); the headline names the dominant side.
+- **`price` / `openInterest` change** — now vs. the recorded tick nearest `now − window`, identical to `/changes` (so `null` until the window has history). `windowHigh`/`windowLow` come from the 5m candles plus the live tick.
+- **`allTimeHigh`** — from Hyperliquid's own daily candles (the full listing history, fetched once per coin per 5 minutes; `null` if the fetch fails or the coin has no candles). `isNewInWindow` is true when a high above every prior high printed inside the window; the pre-window part of the day that straddles the window start is resolved from our 5m candles, so a window shorter than a day still gets a precise answer. `pctBelowAth` is the current price's distance from the high (`0` = at the high); `flags.nearAllTimeHigh` = within 5%.
+- **`openInterest.record`** — the highest OI **this service has recorded** (1h candles are kept forever, so the record deepens the longer the collector runs — `recordedSince`/`recordedDays` say how deep it is). `isRecordHigh` is true when that record was set inside the window; the headline then says "highest level ever recorded on Hyperliquid".
+- **`positioning`** — the long/short trader counts now vs. the snapshot nearest `now − window`, with count and notional deltas (`nLongChangePct` is the "longs increased by X%" number). `null` while the tracker is warming up or when `POSITIONS_ENABLED=false`; `changes` is `null` when no snapshot exists that far back.
+- **`headline`** — assembled from the fields above, so it degrades honestly: sides, directions, and the "all-time high" / "record open interest" claims only appear when the data supports them, and blocks that are `null` are left out of the sentence. Everything in it is also present as a number, so you can write your own copy from the same payload.
 
 ### `GET /v1/perps/:coin/candles?interval=5m|1h|1d`
 OHLC candles **of both price and open interest** rolled up from recorded ticks — this is the per-coin OI chart feed. Params: `from`, `to` (epoch ms/s or ISO), `limit` (default 300, max 5000; most recent within range, ascending). Each row: `mid {o,h,l,c}`, `oi {o,h,l,c}` (coins), `oiUsd {o,h,l,c}`, `markC`, `oracleC`, `fundingHr`, `premiumAvg`, `dayNtlVlm`, `nTicks`.
