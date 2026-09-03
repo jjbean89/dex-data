@@ -178,15 +178,25 @@ export const config = {
   volSignalsEnabled: process.env.VOL_SIGNALS_ENABLED !== "false",
   volSignalCoins: listEnv("VOL_SIGNAL_COINS", ""), // empty = every live coin
   volSignalBars: numEnv("VOL_SIGNAL_BARS", 3),
-  volSignalRvol: numEnv("VOL_SIGNAL_RVOL", 4),
-  volSignalMinBarRvol: numEnv("VOL_SIGNAL_MIN_BAR_RVOL", 1.5),
-  volSignalMinBarUsd: usdEnv("VOL_SIGNAL_MIN_BAR_USD", 250_000),
+  volSignalRvol: numEnv("VOL_SIGNAL_RVOL", 5),
+  volSignalMinBarRvol: numEnv("VOL_SIGNAL_MIN_BAR_RVOL", 2),
+  volSignalMinBarUsd: usdEnv("VOL_SIGNAL_MIN_BAR_USD", 500_000),
   volSignalMaxMoveAtr: numEnv("VOL_SIGNAL_MAX_MOVE_ATR", 1.5),
+  // Positioning confirmation: OI must *grow* by this much (new positions raise OI
+  // whichever side opens them; a drop is de-risking, not a buildup), or taker
+  // flow must be this one-sided.
   volSignalMinOiPct: numEnv("VOL_SIGNAL_MIN_OI_PCT", 1),
-  volSignalMinImbalancePct: numEnv("VOL_SIGNAL_MIN_IMBALANCE_PCT", 60),
+  volSignalMinImbalancePct: numEnv("VOL_SIGNAL_MIN_IMBALANCE_PCT", 70),
+  // A breakout is a move beyond BREAKOUT_ATR × range on a bar carrying at least
+  // BREAKOUT_RVOL × baseline volume; the cumulative-move path scales the range by
+  // √bars elapsed so ordinary drift over two hours doesn't count as confirmation.
   volSignalBreakoutAtr: numEnv("VOL_SIGNAL_BREAKOUT_ATR", 3),
-  volSignalMaxCoins: numEnv("VOL_SIGNAL_MAX_COINS", 15),
+  volSignalBreakoutRvol: numEnv("VOL_SIGNAL_BREAKOUT_RVOL", 2),
+  // More coins than this in buildup at once (open signals + this pass) = market-wide.
+  volSignalMaxCoins: numEnv("VOL_SIGNAL_MAX_COINS", 10),
   volSignalExpireMin: numEnv("VOL_SIGNAL_EXPIRE_MIN", 120),
+  // After a coin's signal closes (confirmed or expired) it can't fire again for this long.
+  volSignalCooldownMin: numEnv("VOL_SIGNAL_COOLDOWN_MIN", 60),
   volSignalMinHistoryHours: numEnv("VOL_SIGNAL_MIN_HISTORY_HOURS", 6),
   volSignalNotify: process.env.VOL_SIGNAL_NOTIFY !== "false",
 
@@ -296,6 +306,8 @@ export function assertConfig(): void {
     if (config.volSignalMinOiPct < 0) throw new Error("VOL_SIGNAL_MIN_OI_PCT must be non-negative");
     if (config.volSignalMaxCoins < 1) throw new Error("VOL_SIGNAL_MAX_COINS must be at least 1");
     if (config.volSignalExpireMin < 5) throw new Error("VOL_SIGNAL_EXPIRE_MIN must be at least 5");
+    if (config.volSignalBreakoutRvol < 0) throw new Error("VOL_SIGNAL_BREAKOUT_RVOL must be non-negative");
+    if (config.volSignalCooldownMin < 0) throw new Error("VOL_SIGNAL_COOLDOWN_MIN must be non-negative");
   }
   if (config.whalesEnabled) {
     if (!/^https?:\/\//.test(config.arbitrumRpcUrl)) {

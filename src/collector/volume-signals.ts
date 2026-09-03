@@ -22,11 +22,18 @@ import { formatUsd, sendWebhook, webhookConfigured } from "./webhook.js";
 //              taker flow is one-sided (≥ VOL_SIGNAL_MIN_IMBALANCE_PCT one way).
 //              On a perp, accumulation shows up as OI growth; churn doesn't.
 //
-// One open signal per coin. It is confirmed when a subsequent bar (or the move
-// since the signal) exceeds VOL_SIGNAL_BREAKOUT_ATR × range on abnormal volume,
-// or expires after VOL_SIGNAL_EXPIRE_MIN. When more than VOL_SIGNAL_MAX_COINS
-// coins trigger in the same pass it's a venue-wide event, recorded as such
-// (market_wide) and notified once, not per coin.
+// One open signal per coin. It is confirmed when a subsequent bar moves more
+// than VOL_SIGNAL_BREAKOUT_ATR × range on ≥ VOL_SIGNAL_BREAKOUT_RVOL × baseline
+// volume, or when the cumulative move since the signal exceeds that range scaled
+// by √(bars elapsed) — a random walk drifts ~√n ranges in n bars, so an unscaled
+// cumulative test confirms almost every signal inside two hours — while volume is
+// still elevated; it expires after VOL_SIGNAL_EXPIRE_MIN otherwise. Once a
+// coin's signal closes it can't fire again for VOL_SIGNAL_COOLDOWN_MIN (a buildup
+// that is still running would otherwise re-fire the minute its signal confirms).
+// When more than VOL_SIGNAL_MAX_COINS coins are in buildup at once — signals
+// already open plus this pass — it's a venue-wide event: rows are recorded as
+// market_wide and the webhook gets one summary per cooldown window, no per-coin
+// signals or confirmations.
 
 const EVAL_INTERVAL_MS = 60_000;
 
@@ -36,19 +43,33 @@ interface OpenSignal {
   atrPct: number;
   pxTo: number;
   tToMs: number;
+  marketWide: boolean;
 }
 
 export function startVolumeSignals(isStopped: () => boolean): () => Promise<void> {
   const open = new Map<string, OpenSignal>();
+  const cooldownUntil = new Map<string, number>(); // coin → ms until which it can't fire again
+  let lastMarketWideNotifyMs = 0;
   let fired = 0;
   let confirmed = 0;
 
   async function init(): Promise<boolean> {
     try {
-      const { rows } = await pool.query<{ id: string; coin: string; fired_at: Date; atr_pct: number; px_to: number; t_to: Date }>(
-        "select id, coin, fired_at, atr_pct, px_to, t_to from vol_signals where status = 'open'",
+      const { rows } = await pool.query<{ id: string; coin: string; fired_at: Date; atr_pct: number; px_to: number; t_to: Date; market_wide: boolean }>(
+        "select id, coin, fired_at, atr_pct, px_to, t_to, market_wide from vol_signals where status = 'open'",
       );
-      for (const r of rows) open.set(r.coin, { id: r.id, firedAtMs: r.fired_at.getTime(), atrPct: r.atr_pct, pxTo: r.px_to, tToMs: r.t_to.getTime() });
+      for (const r of rows) {
+        open.set(r.coin, { id: r.id, firedAtMs: r.fired_at.getTime(), atrPct: r.atr_pct, pxTo: r.px_to, tToMs: r.t_to.getTime(), marketWide: r.market_wide });
+      }
+      // Cooldowns survive restarts: a redeploy right after a confirmation must not re-fire the same buildup.
+      const cooldownMs = config.volSignalCooldownMin * 60_000;
+      if (cooldownMs > 0) {
+        const { rows: closed } = await pool.query<{ coin: string; closed_at: Date }>(
+          "select coin, max(closed_at) as closed_at from vol_signals where closed_at > to_timestamp($1 / 1000.0) group by coin",
+          [Date.now() - cooldownMs],
+        );
+        for (const r of closed) cooldownUntil.set(r.coin, r.closed_at.getTime() + cooldownMs);
+      }
       return true;
     } catch (err) {
       logErr("vol-signals", "init failed — retrying", err);
@@ -68,10 +89,17 @@ export function startVolumeSignals(isStopped: () => boolean): () => Promise<void
     if (m.rvol < config.volSignalRvol || m.minBarRvol < config.volSignalMinBarRvol) return false;
     if (m.avgBarUsd < config.volSignalMinBarUsd) return false;
     if (m.moveAtr > config.volSignalMaxMoveAtr) return false;
-    const oiConfirms = m.oiChangePct !== null && Math.abs(m.oiChangePct) >= config.volSignalMinOiPct;
+    // Opening positions raises OI whichever side opens them; falling OI on heavy
+    // volume is de-risking (closes, liquidations), the opposite of a buildup.
+    const oiConfirms = m.oiChangePct !== null && m.oiChangePct >= config.volSignalMinOiPct;
     const imb = config.volSignalMinImbalancePct;
     const flowConfirms = m.buySharePct >= imb || m.buySharePct <= 100 - imb;
     return oiConfirms || flowConfirms;
+  }
+
+  function closeSignal(coin: string, nowMs: number): void {
+    open.delete(coin);
+    if (config.volSignalCooldownMin > 0) cooldownUntil.set(coin, nowMs + config.volSignalCooldownMin * 60_000);
   }
 
   function biasOf(m: VolMetrics): "long" | "short" | "mixed" {
@@ -111,19 +139,32 @@ export function startVolumeSignals(isStopped: () => boolean): () => Promise<void
         await followUp(coin, cur, m, c.bars, nowMs);
         continue;
       }
+      const until = cooldownUntil.get(coin);
+      if (until !== undefined) {
+        if (nowMs < until) continue;
+        cooldownUntil.delete(coin);
+      }
       if (qualifies(m)) candidates.push({ m, bias: biasOf(m) });
     }
     if (candidates.length === 0) return;
-    const marketWide = candidates.length > config.volSignalMaxCoins;
+    // "At once" counts the signals still open, not just this pass: a venue-wide
+    // surge trips coins over several minutes, rarely in the same minute.
+    const inBuildup = open.size + candidates.length;
+    const marketWide = inBuildup > config.volSignalMaxCoins;
     for (const cand of candidates) await fire(cand.m, cand.bias, marketWide, nowMs);
     if (marketWide) {
-      const msg = `market-wide volume surge: ${candidates.length} coins on abnormal volume with flat price at once (${candidates
+      const coins = [...open.keys()];
+      const msg = `market-wide volume surge: ${inBuildup} coins on abnormal volume with flat price at once (${coins
         .slice(0, 8)
-        .map((c) => c.m.coin)
-        .join(", ")}${candidates.length > 8 ? ", …" : ""}) — recorded, not alerted individually`;
+        .join(", ")}${coins.length > 8 ? ", …" : ""}) — recorded, not alerted individually`;
       log("vol-signals", msg);
-      await opsEvent("vol-signals", "info", msg);
-      if (notifyOn()) void sendWebhook(`📊 ${msg}`, { type: "volume_market_wide", coins: candidates.map((c) => c.m.coin), t: new Date(nowMs).toISOString() });
+      // One summary per cooldown window, not one per minute while the surge lasts.
+      const quietMs = Math.max(config.volSignalCooldownMin, 15) * 60_000;
+      if (nowMs - lastMarketWideNotifyMs >= quietMs) {
+        lastMarketWideNotifyMs = nowMs;
+        await opsEvent("vol-signals", "info", msg);
+        if (notifyOn()) void sendWebhook(`📊 ${msg}`, { type: "volume_market_wide", coins, t: new Date(nowMs).toISOString() });
+      }
     }
   }
 
@@ -162,7 +203,7 @@ export function startVolumeSignals(isStopped: () => boolean): () => Promise<void
       ],
     );
     const id = rows[0]!.id;
-    open.set(m.coin, { id, firedAtMs: nowMs, atrPct: m.atrPct!, pxTo: m.pxTo, tToMs: m.tToMs });
+    open.set(m.coin, { id, firedAtMs: nowMs, atrPct: m.atrPct!, pxTo: m.pxTo, tToMs: m.tToMs, marketWide });
     fired++;
     log("vol-signals", `${marketWide ? "SIGNAL (market-wide)" : "SIGNAL"} ${message}`);
     if (notifyOn() && !marketWide) void deliver(id, "vol_signals", `📈 ${message}`, { type: "volume_buildup", signal: envelope(id, m, bias, message) });
@@ -172,18 +213,25 @@ export function startVolumeSignals(isStopped: () => boolean): () => Promise<void
   // confirm on a breakout bar / cumulative move, or expire.
   async function followUp(coin: string, cur: OpenSignal, m: VolMetrics, bars: Array<{ tMs: number; o: number; c: number; ntl: number; fraction: number }>, nowMs: number): Promise<void> {
     const breakoutPct = config.volSignalBreakoutAtr * cur.atrPct;
+    const minRvol = config.volSignalBreakoutRvol;
+    // Volume is unknown only while the coin has no baseline; then the move alone decides.
+    const onVolume = (rvol: number | null): boolean => rvol === null || rvol >= minRvol;
     let breakout: { movePct: number; rvol: number | null } | null = null;
     for (const b of bars) {
       if (b.tMs <= cur.tToMs) continue; // bars that were part of the buildup window don't count
       const move = b.o > 0 ? ((b.c - b.o) / b.o) * 100 : 0;
-      if (Math.abs(move) >= breakoutPct) {
-        breakout = { movePct: move, rvol: m.baselineBar ? b.ntl / (m.baselineBar * b.fraction) : null };
+      const rvol = m.baselineBar ? b.ntl / (m.baselineBar * b.fraction) : null;
+      if (Math.abs(move) >= breakoutPct && onVolume(rvol)) {
+        breakout = { movePct: move, rvol };
         break;
       }
     }
-    if (!breakout && cur.pxTo > 0) {
+    if (!breakout && cur.pxTo > 0 && onVolume(m.rvol)) {
+      // Cumulative path: price drifts ~√n ranges over n bars even with nothing going
+      // on, so the bar threshold is scaled by √(bars since the signal's window).
+      const barsSince = Math.max(1, (nowMs - cur.firedAtMs) / 300_000);
       const move = ((m.pxTo - cur.pxTo) / cur.pxTo) * 100;
-      if (Math.abs(move) >= breakoutPct) breakout = { movePct: move, rvol: m.rvol };
+      if (Math.abs(move) >= breakoutPct * Math.sqrt(barsSince)) breakout = { movePct: move, rvol: m.rvol };
     }
     if (breakout) {
       await pool.query(
@@ -191,17 +239,20 @@ export function startVolumeSignals(isStopped: () => boolean): () => Promise<void
            breakout_move_pct = $2, breakout_rvol = $3, updated_at = now() where id = $1`,
         [cur.id, breakout.movePct, breakout.rvol],
       );
-      open.delete(coin);
+      closeSignal(coin, nowMs);
       confirmed++;
       const mins = Math.round((nowMs - cur.firedAtMs) / 60_000);
       const message = `${coin} breakout confirmed: ${breakout.movePct >= 0 ? "+" : ""}${breakout.movePct.toFixed(2)}%${breakout.rvol ? ` on ${breakout.rvol.toFixed(1)}x volume` : ""}, ${mins}min after the buildup signal`;
       log("vol-signals", `CONFIRMED ${message}`);
-      if (notifyOn()) void sendWebhook(`✅ ${message}`, { type: "volume_breakout", signalId: cur.id, coin, movePct: breakout.movePct, rvol: breakout.rvol, minutesAfterSignal: mins, message });
+      // A market-wide row was never announced, so its confirmation isn't either.
+      if (notifyOn() && !cur.marketWide) {
+        void sendWebhook(`✅ ${message}`, { type: "volume_breakout", signalId: cur.id, coin, movePct: breakout.movePct, rvol: breakout.rvol, minutesAfterSignal: mins, message });
+      }
       return;
     }
     if (nowMs - cur.firedAtMs > config.volSignalExpireMin * 60_000) {
       await pool.query("update vol_signals set status = 'expired', closed_at = now(), updated_at = now() where id = $1", [cur.id]);
-      open.delete(coin);
+      closeSignal(coin, nowMs);
       log("vol-signals", `expired: ${coin} signal #${cur.id} — no breakout within ${config.volSignalExpireMin}min`);
       return;
     }
@@ -292,8 +343,9 @@ export function startVolumeSignals(isStopped: () => boolean): () => Promise<void
   log(
     "vol-signals",
     `detector started: ${config.volSignalBars}×5m window, rvol ≥ ${config.volSignalRvol} (each bar ≥ ${config.volSignalMinBarRvol}), ` +
-      `≥ ${formatUsd(config.volSignalMinBarUsd)}/bar, move ≤ ${config.volSignalMaxMoveAtr}×range, OI ≥ ${config.volSignalMinOiPct}% or flow ≥ ${config.volSignalMinImbalancePct}%, ` +
-      `breakout ${config.volSignalBreakoutAtr}×range, coins ${config.volSignalCoins.length > 0 ? config.volSignalCoins.join("/") : "all"}, notify ${notifyOn() ? "on" : "off"}`,
+      `≥ ${formatUsd(config.volSignalMinBarUsd)}/bar, move ≤ ${config.volSignalMaxMoveAtr}×range, OI +${config.volSignalMinOiPct}% or flow ≥ ${config.volSignalMinImbalancePct}%, ` +
+      `breakout ${config.volSignalBreakoutAtr}×range on ≥ ${config.volSignalBreakoutRvol}× volume, cooldown ${config.volSignalCooldownMin}min, ` +
+      `market-wide above ${config.volSignalMaxCoins} coins, coins ${config.volSignalCoins.length > 0 ? config.volSignalCoins.join("/") : "all"}, notify ${notifyOn() ? "on" : "off"}`,
   );
   return async () => {
     await run;

@@ -105,13 +105,14 @@ Deploys are zero-drama: the collector shuts down gracefully on SIGTERM and the D
 | `VOL_SIGNALS_ENABLED` | `true` | Volume-leading-price detector (see `/v1/signals`) |
 | `VOL_SIGNAL_COINS` | — (all) | Restrict the detector to a comma list of coins |
 | `VOL_SIGNAL_BARS` | `3` | Window length in 5m bars |
-| `VOL_SIGNAL_RVOL` / `VOL_SIGNAL_MIN_BAR_RVOL` | `4` / `1.5` | Window volume vs. baseline; floor every bar must clear (sustained, not one print) |
-| `VOL_SIGNAL_MIN_BAR_USD` | `250k` | Ignore coins trading less than this per 5m bar |
+| `VOL_SIGNAL_RVOL` / `VOL_SIGNAL_MIN_BAR_RVOL` | `5` / `2` | Window volume vs. baseline; floor every bar must clear (sustained, not one print) |
+| `VOL_SIGNAL_MIN_BAR_USD` | `500k` | Ignore coins trading less than this per 5m bar |
 | `VOL_SIGNAL_MAX_MOVE_ATR` | `1.5` | "Flat": net move ≤ this × the coin's typical 5m range |
-| `VOL_SIGNAL_MIN_OI_PCT` / `VOL_SIGNAL_MIN_IMBALANCE_PCT` | `1` / `60` | Positioning confirmation: OI change over the window, or taker share one way |
-| `VOL_SIGNAL_BREAKOUT_ATR` | `3` | Confirms a signal when a later bar (or the move since) exceeds this × range |
-| `VOL_SIGNAL_MAX_COINS` | `15` | More coins than this triggering together = market-wide event, notified once |
-| `VOL_SIGNAL_EXPIRE_MIN` / `VOL_SIGNAL_MIN_HISTORY_HOURS` | `120` / `6` | Signal lifetime without a breakout; bars needed before a coin is eligible |
+| `VOL_SIGNAL_MIN_OI_PCT` / `VOL_SIGNAL_MIN_IMBALANCE_PCT` | `1` / `70` | Positioning confirmation: OI *growth* over the window, or taker share one way |
+| `VOL_SIGNAL_BREAKOUT_ATR` / `VOL_SIGNAL_BREAKOUT_RVOL` | `3` / `2` | Confirms a signal when a later bar exceeds this × range on at least this × baseline volume (the cumulative-move path scales the range by √bars elapsed) |
+| `VOL_SIGNAL_MAX_COINS` | `10` | More coins than this in buildup at once (open signals + new) = market-wide event, one summary per cooldown window |
+| `VOL_SIGNAL_EXPIRE_MIN` / `VOL_SIGNAL_COOLDOWN_MIN` | `120` / `60` | Signal lifetime without a breakout; how long a coin stays quiet after its signal closes |
+| `VOL_SIGNAL_MIN_HISTORY_HOURS` | `6` | Bars needed before a coin is eligible |
 | `VOL_SIGNAL_NOTIFY` | `true` | Push signals and confirmations to the webhook |
 | `WHALES_ENABLED` | `true` | Bridge deposit watcher + whale wallet tracking (see `/v1/whales/new`) |
 | `ARBITRUM_RPC_URL` | `https://arb1.arbitrum.io/rpc` | Any Arbitrum One JSON-RPC endpoint (public works; a free provider key is steadier) |
@@ -250,12 +251,12 @@ Baseline = the median 5m notional over the trailing 24h, blended 50/50 with the 
 
 | Condition | Default |
 |---|---|
-| Window volume vs. baseline | ≥ 4× over 3 bars (15m), every bar ≥ 1.5× |
-| Minimum size | ≥ $250k per 5m bar |
+| Window volume vs. baseline | ≥ 5× over 3 bars (15m), every bar ≥ 2× |
+| Minimum size | ≥ $500k per 5m bar |
 | Price flat | net move ≤ 1.5 × typical 5m range |
-| Positioning | open interest moved ≥ 1% over the window, **or** taker flow ≥ 60% one way |
+| Positioning | open interest **grew** ≥ 1% over the window, **or** taker flow ≥ 70% one way |
 
-`bias` is `long` / `short` / `mixed` from the taker split (and OI direction). A signal stays `open` (one per coin) and is **confirmed** when a subsequent 5m bar, or the cumulative move since the signal, exceeds 3× the coin's range; it **expires** after 2h otherwise. Confirmed vs. expired counts are the detector's scorecard — tune the thresholds from `/v1/signals?status=confirmed` against `status=expired` once a couple of weeks of bars exist.
+`bias` is `long` / `short` / `mixed` from the taker split (and OI direction). A signal stays `open` (one per coin) and is **confirmed** when a subsequent 5m bar moves more than 3× the coin's range on at least 2× baseline volume, or when the cumulative move since the signal exceeds 3× range × √(bars elapsed) while volume is still elevated (price drifts about √n ranges over n bars on its own, so an unscaled cumulative test would confirm nearly everything inside two hours); it **expires** after 2h otherwise. After a signal closes either way the coin stays quiet for `VOL_SIGNAL_COOLDOWN_MIN` (1h), so a buildup that keeps running doesn't re-fire the minute its signal confirms. Confirmed vs. expired counts are the detector's scorecard — tune the thresholds from `/v1/signals?status=confirmed` against `status=expired` once a couple of weeks of bars exist.
 
 Params: `coin`, `status` (`open|confirmed|expired`), `since`, `marketWide`, `limit`. Each row carries the window numbers at fire time (`rvol`, `volNtlUsd` vs `expectedNtlUsd`, `pxMovePct`, `atrPct`, `oiChangePct`, `buySharePct`, `twapSharePct`), the confirmation (`breakoutMovePct`, `breakoutRvol`, `confirmedAt`) and delivery status.
 
@@ -272,7 +273,8 @@ Params: `coin`, `status` (`open|confirmed|expired`), `since`, `marketWide`, `lim
 ```
 
 Honest semantics:
-- **Market-wide events are separated out.** When more than `VOL_SIGNAL_MAX_COINS` coins trigger in one pass (a venue-wide move, a macro print), the rows are recorded with `marketWide: true` and the webhook gets a single summary instead of one message per coin.
+- **Market-wide events are separated out.** When more than `VOL_SIGNAL_MAX_COINS` coins are in buildup at once — signals still open plus the ones triggering this pass (a venue-wide move, a macro print; the coins trip over several minutes, rarely in the same one) — the new rows are recorded with `marketWide: true` and the webhook gets a single summary per cooldown window instead of one message per coin; their confirmations aren't pushed either.
+- **Rvol is against a median.** The baseline is the coin's *median* 5m notional, so a thin coin whose typical bar is $4k prints "180× volume" on $600k; that is what `VOL_SIGNAL_MIN_BAR_USD` is for. Raise it (or set `VOL_SIGNAL_COINS`) if the small caps are the noise.
 - **Known false positives**: funding settlement at the top of the hour, large TWAPs (`twapSharePct` tells you when the "accumulation" is a scheduled order), listings younger than `VOL_SIGNAL_MIN_HISTORY_HOURS`, and market-maker churn — the OI/flow confirmation exists to drop the last one.
 - Signals and confirmations go to `LIQ_ALERT_WEBHOOK_URL` as `📈 …` / `✅ …` messages (JSON envelopes `volume_buildup`, `volume_breakout`, `volume_market_wide`).
 
