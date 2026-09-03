@@ -21,7 +21,9 @@ import {
   whaleWallets,
   listWhaleAlerts,
   liqCandles,
+  liqLargestOrders,
   liqTotals,
+  liqVenueTraders,
   marketCandles,
   marketOiCloseAt,
   perpCandles,
@@ -39,6 +41,7 @@ import {
   type EmaStateApiRow,
   type LiqCandleRow,
   type LiqFillRow,
+  type LiqLargestRow,
   type LiqTotalsRow,
   type MarketCandleRow,
   type PerpCandleRow,
@@ -47,6 +50,8 @@ import {
   type WalletPositionRow,
   type WhaleRow,
 } from "./queries.js";
+import { serializeWhaleCoin, whaleHeadline } from "../collector/liq-whales.js";
+import { formatUsd } from "../collector/webhook.js";
 import { aprPct, cached, parseLimit, parseTimeMs, parseWindow, pctChange, rollingMean } from "./util.js";
 
 type Query = Record<string, string | undefined>;
@@ -227,6 +232,7 @@ const ZERO_LIQ_TOTALS = {
   shorts: { ntlUsd: 0, events: 0, fills: 0 },
   totalNtlUsd: 0,
   events: 0,
+  traders: 0,
 };
 
 function serializeLiqTotals(r: LiqTotalsRow | undefined): Record<string, unknown> {
@@ -236,7 +242,67 @@ function serializeLiqTotals(r: LiqTotalsRow | undefined): Record<string, unknown
     shorts: { ntlUsd: r.short_ntl, events: r.short_events, fills: r.short_fills },
     totalNtlUsd: r.long_ntl + r.short_ntl,
     events: r.long_events + r.short_events,
+    traders: r.traders,
   };
+}
+
+function serializeLiqLargest(r: LiqLargestRow | undefined, includeCoin: boolean): Record<string, unknown> | null {
+  if (!r) return null;
+  return {
+    ...(includeCoin ? { coin: r.coin } : {}),
+    ntlUsd: r.ntl,
+    side: r.side,
+    px: r.px,
+    fills: r.fills,
+    wallet: r.wallet,
+    explorer: `https://app.hyperliquid.xyz/explorer/address/${r.wallet}`,
+    t: r.ts.toISOString(),
+    tMs: r.ts.getTime(),
+  };
+}
+
+function fmtPct(pct: number): string {
+  return `${pct >= 0 ? "+" : "−"}${Math.abs(pct).toFixed(2)}%`;
+}
+
+function fmtInt(n: number): string {
+  return n.toLocaleString("en-US");
+}
+
+// Price move over a trailing window, as reported by the /changes bundle (null past
+// RAW_RETENTION_DAYS, when there are no ticks left to compare against).
+function serializePxMove(row: ChangeRow | undefined): Record<string, unknown> | null {
+  if (!row || row.pxChangePct === null) return null;
+  return { now: row.px, then: row.pxThen, changePct: row.pxChangePct, thenTs: row.thenTs };
+}
+
+// One-line narrative for a coin (or the venue when coin = null) over a window:
+//   "$4.65M of BTC shorts liquidated as BTC moved +2.31% in the last 1h — 187 traders liquidated"
+// The dominant side leads; the other side is mentioned when it is at least a quarter
+// of the total. Liquidations only — stop-outs are private orders and not observable.
+function liqHeadline(
+  coin: string | null,
+  window: string,
+  r: LiqTotalsRow | undefined,
+  traders: number,
+  largest: LiqLargestRow | undefined,
+  px: ChangeRow | undefined,
+): string | null {
+  if (!r || r.long_ntl + r.short_ntl <= 0) return null;
+  const longsLead = r.long_ntl >= r.short_ntl;
+  const [lead, leadNtl, other, otherNtl] = longsLead
+    ? (["longs", r.long_ntl, "shorts", r.short_ntl] as const)
+    : (["shorts", r.short_ntl, "longs", r.long_ntl] as const);
+  const subject = coin ? `${coin} ${lead}` : lead;
+  let text = `${formatUsd(leadNtl)} of ${subject} liquidated`;
+  if (otherNtl >= 0.25 * (leadNtl + otherNtl)) text += ` (and ${formatUsd(otherNtl)} of ${other})`;
+  if (coin && px && px.pxChangePct !== null) text += ` as ${coin} moved ${fmtPct(px.pxChangePct)}`;
+  text += ` in the last ${window}`;
+  const tail: string[] = [];
+  if (traders > 0) tail.push(`${fmtInt(traders)} trader${traders === 1 ? "" : "s"} liquidated`);
+  if (largest) tail.push(`largest single order ${coin ? "" : `${largest.coin} `}${formatUsd(largest.ntl)}`);
+  if (tail.length > 0) text += ` — ${tail.join(", ")}`;
+  return text;
 }
 
 function bridgeWarmingUp(reply: FastifyReply): FastifyReply {
@@ -338,7 +404,23 @@ function serializeLiqWhale(r: LiqWhaleRow): Record<string, unknown> {
     thresholdUsd: r.threshold_usd,
     events: r.events,
     fills: r.fills,
-    coins: r.coins.map((c) => ({ coin: c.coin, side: c.side, ntlUsd: c.ntl, events: c.events, fills: c.fills })),
+    coins: r.coins.map(serializeWhaleCoin),
+    // The wallet after the burst (null = not checked: pre-015 rows, or the fetch failed).
+    stateAfter: r.state_after
+      ? {
+          checkedAt: r.state_after.checkedAt,
+          accountValueUsd: r.state_after.accountValue,
+          totalNtlPosUsd: r.state_after.totalNtlPos,
+          positions: r.state_after.positions.map((p) => ({
+            coin: p.coin,
+            side: p.szi > 0 ? "long" : "short",
+            sz: Math.abs(p.szi),
+            entryPx: p.entryPx,
+            ntlUsd: p.positionValue,
+          })),
+        }
+      : null,
+    headline: whaleHeadline(r.wallet, r.coins),
     active: r.active,
     delivered: r.delivered,
     deliveryError: r.delivery_error,
@@ -1065,11 +1147,18 @@ export function registerRoutes(app: FastifyInstance): void {
     const limit = parseLimit(q.limit, 250, 500);
     if (limit === null) return bad(reply, "invalid limit");
 
-    const [perWindow, lastAt] = await Promise.all([
+    // Price moves are only computable while raw ticks exist for the window start.
+    const rawMs = config.rawRetentionDays * 86_400_000;
+    const [perWindow, perLargest, perTraders, perChanges, lastAt] = await Promise.all([
       Promise.all(windows.map((w) => cached(`liq:totals:${w.ms}`, CACHE_MS, () => liqTotals(w.ms, null)))),
+      Promise.all(windows.map((w) => cached(`liq:largest:${w.ms}`, CACHE_MS, () => liqLargestOrders(w.ms)))),
+      Promise.all(windows.map((w) => cached(`liq:traders:${w.ms}`, CACHE_MS, () => liqVenueTraders(w.ms)))),
+      Promise.all(windows.map((w) => (w.ms <= rawMs ? getChanges(w.ms) : Promise.resolve<ChangesBundle | null>(null)))),
       cached("liq:lastAt", CACHE_MS, lastLiqAt),
     ]);
     const byWindow = perWindow.map((rows) => new Map(rows.map((r) => [r.coin, r])));
+    const largestByWindow = perLargest.map((rows) => new Map(rows.map((r) => [r.coin, r])));
+    const changesByWindow = perChanges.map((b) => new Map((b?.rows ?? []).map((r) => [r.coin, r])));
     const coins = new Set<string>();
     for (const rows of perWindow) for (const r of rows) coins.add(r.coin);
     const rank = (r: LiqTotalsRow | undefined): number =>
@@ -1080,7 +1169,8 @@ export function registerRoutes(app: FastifyInstance): void {
       .slice(0, limit);
     const totals = Object.fromEntries(
       windows.map((w, i) => {
-        const agg: LiqTotalsRow = { coin: "*", long_ntl: 0, short_ntl: 0, long_events: 0, short_events: 0, long_fills: 0, short_fills: 0 };
+        const agg: LiqTotalsRow = { coin: "*", long_ntl: 0, short_ntl: 0, long_events: 0, short_events: 0, long_fills: 0, short_fills: 0, traders: perTraders[i]! };
+        let largest: LiqLargestRow | undefined;
         for (const r of perWindow[i]!) {
           agg.long_ntl += r.long_ntl;
           agg.short_ntl += r.short_ntl;
@@ -1089,7 +1179,15 @@ export function registerRoutes(app: FastifyInstance): void {
           agg.long_fills += r.long_fills;
           agg.short_fills += r.short_fills;
         }
-        return [w.name, serializeLiqTotals(agg)];
+        for (const l of perLargest[i]!) if (!largest || l.ntl > largest.ntl) largest = l;
+        return [
+          w.name,
+          {
+            ...serializeLiqTotals(agg),
+            largest: serializeLiqLargest(largest, true),
+            headline: liqHeadline(null, w.name, agg, agg.traders, largest, undefined),
+          },
+        ];
       }),
     );
     return {
@@ -1099,7 +1197,22 @@ export function registerRoutes(app: FastifyInstance): void {
       totals,
       data: ranked.map((coin) => ({
         coin,
-        windows: Object.fromEntries(windows.map((w, i) => [w.name, serializeLiqTotals(byWindow[i]!.get(coin))])),
+        windows: Object.fromEntries(
+          windows.map((w, i) => {
+            const r = byWindow[i]!.get(coin);
+            const largest = largestByWindow[i]!.get(coin);
+            const px = changesByWindow[i]!.get(coin);
+            return [
+              w.name,
+              {
+                ...serializeLiqTotals(r),
+                largest: serializeLiqLargest(largest, false),
+                px: serializePxMove(px),
+                headline: liqHeadline(coin, w.name, r, r?.traders ?? 0, largest, px),
+              },
+            ];
+          }),
+        ),
       })),
     };
   });

@@ -6,6 +6,21 @@ export interface WhaleCoinBreakdown {
   ntl: number;
   events: number;
   fills: number;
+  // Price context (absent on rows recorded before migration 015):
+  pxBefore?: number | null; // 1h before the burst's first fill
+  pxStart?: number | null; // at the first fill
+  pxEnd?: number | null; // at the latest fill
+  // What the wallet still holds in this coin after the burst (null = not checked):
+  remainingSz?: number | null; // signed, HL convention (>0 long)
+  remainingNtlUsd?: number | null;
+  fullyLiquidated?: boolean | null;
+}
+
+export interface WhaleStateAfter {
+  checkedAt: string;
+  accountValue: number | null;
+  totalNtlPos: number | null;
+  positions: Array<{ coin: string; szi: number; entryPx: number | null; positionValue: number | null }>;
 }
 
 export interface LiqWhaleRow {
@@ -23,6 +38,8 @@ export interface LiqWhaleRow {
   delivered: boolean | null;
   delivery_error: string | null;
   updated_at: Date;
+  state_after: WhaleStateAfter | null;
+  state_checked_at: Date | null;
 }
 
 export interface LiqWhaleFilter {
