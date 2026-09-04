@@ -204,6 +204,16 @@ Where each block comes from, and what the flags mean:
 - **`positioning`** — the long/short trader counts now vs. the snapshot nearest `now − window`, with count and notional deltas (`nLongChangePct` is the "longs increased by X%" number). `entries` carries the size-weighted average entry price per side and how many positions with a known entry are in profit at that snapshot's price (same fields as `/positioning`; `null` on backfilled rows), and `changes` adds the average-entry drift over the window — a rising long average entry with a stable count means late buyers, not a bigger crowd. `null` while the tracker is warming up or when `POSITIONS_ENABLED=false`; `changes` is `null` when no snapshot exists that far back.
 - **`flags`** — the booleans behind the usual claims (`newAllTimeHigh`, `nearAllTimeHigh`, `oiRecordHigh`, `liquidationsSide`, `longsIncreased`), `null` where the underlying block is. Change fields are `null` rather than fabricated when the window has no history yet, so check for `null` before writing a direction.
 
+### `GET /v1/perps/recaps?window=24h&sort=oi&limit=5`
+**The movers feed** — rank every coin by change over the window, take the top N, and return each one's full `/recap` payload in a single response: "the five biggest open-interest gainers today, and what happened to each". Params: `window` (default `24h`), `sort` (`oi` = OI change %, `volumeChange` = 24h-volume change %, `px` = price change %; default `oi`), `dir` (default `desc`), `limit` (default 5, max 20), `minOiUsd` and `minVolumeUsd` (**default $1,000,000 each** — pass `0` to lift them). Coins with no reading for the sort key (a listing younger than the window) are skipped.
+
+```json
+{ "window": "24h", "asOf": "2026-09-04T00:28:05.755Z", "sort": "oi", "dir": "desc",
+  "minOiUsd": 1000000, "minVolumeUsd": 1000000, "eligible": 69, "count": 5,
+  "data": [{ "rank": 1, "rankedBy": "oi", "rankValuePct": 263.5, "coin": "AZTEC", "...": "full /recap payload" },
+           { "rank": 2, "rankedBy": "oi", "rankValuePct": 99.9, "coin": "PONS", "...": "" }] }
+```
+
 ### `GET /v1/perps/:coin/candles?interval=5m|1h|1d`
 OHLC candles **of both price and open interest** rolled up from recorded ticks — this is the per-coin OI chart feed. Params: `from`, `to` (epoch ms/s or ISO), `limit` (default 300, max 5000; most recent within range, ascending). Each row: `mid {o,h,l,c}`, `oi {o,h,l,c}` (coins), `oiUsd {o,h,l,c}`, `markC`, `oracleC`, `fundingHr`, `premiumAvg`, `dayNtlVlm`, `nTicks`.
 

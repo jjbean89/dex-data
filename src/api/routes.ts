@@ -57,6 +57,7 @@ const CACHE_MS = 10_000;
 const CANDLE_LIMIT_MAX = 5_000;
 const BUCKET_MS: Record<CandleInterval, number> = { "5m": 300_000, "1h": 3_600_000, "1d": 86_400_000 };
 const CHANGE_WINDOWS = ["1h", "4h", "24h"] as const;
+const RECAPS_LIMIT_MAX = 20; // each recap is several queries plus a cached HL candle fetch
 
 function bad(reply: FastifyReply, message: string): FastifyReply {
   return reply.code(400).send({ error: { code: "bad_request", message } });
@@ -589,6 +590,7 @@ export function registerRoutes(app: FastifyInstance): void {
       "GET /v1/perps/emas?tf=1h,4h,12h,1d&coins=&minOiUsd=0&limit=500",
       "GET /v1/perps/:coin",
       "GET /v1/perps/:coin/recap?window=24h",
+      "GET /v1/perps/recaps?window=24h&sort=oi|volumeChange|px&dir=desc&limit=5&minOiUsd=1000000&minVolumeUsd=1000000",
       "GET /v1/perps/:coin/emas",
       "GET /v1/perps/:coin/candles?interval=5m|1h|1d&from=&to=&limit=300",
       "GET /v1/perps/:coin/funding-history?from=&to=&limit=168",
@@ -914,6 +916,67 @@ export function registerRoutes(app: FastifyInstance): void {
       window: windowRaw,
       asOf: bundle.asOf,
       toleranceSec: Math.round(toleranceFor(windowMs) / 1000),
+      count: data.length,
+      data,
+    };
+  });
+
+  // Ranked recaps: the top-N movers by OI / volume / price change over a window,
+  // each with its full recap — the "what are the five biggest OI gainers doing"
+  // feed in one request. Floors default to $1M OI and $1M 24h volume.
+  app.get("/v1/perps/recaps", async (req, reply) => {
+    const q = req.query as Query;
+    const windowRaw = q.window ?? "24h";
+    const windowMs = parseWindow(windowRaw);
+    if (windowMs === null) return bad(reply, `invalid window "${windowRaw}" — use e.g. 1h, 4h, 24h, 7d`);
+    if (windowMs < 5 * 60_000) return bad(reply, "window must be at least 5m");
+    const maxDays = Math.min(config.rawRetentionDays, config.liqRetentionDays);
+    if (windowMs > maxDays * 86_400_000) {
+      return bad(reply, `window exceeds raw tick retention (${maxDays}d) — use the candle endpoints for longer ranges`);
+    }
+    const sorters: Record<string, (r: ChangeRow) => number | null> = {
+      oi: (r) => r.oiUsdChangePct,
+      volumeChange: (r) => r.dayNtlVlmChangePct,
+      px: (r) => r.pxChangePct,
+    };
+    const sortRaw = q.sort ?? "oi";
+    const sorter = sorters[sortRaw];
+    if (!sorter) return bad(reply, `invalid sort "${sortRaw}" — use oi|volumeChange|px`);
+    const dir = q.dir ?? "desc";
+    if (dir !== "asc" && dir !== "desc") return bad(reply, 'dir must be "asc" or "desc"');
+    const limit = parseLimit(q.limit, 5, RECAPS_LIMIT_MAX);
+    if (limit === null) return bad(reply, `invalid limit — use 1..${RECAPS_LIMIT_MAX}`);
+    const minOiUsd = q.minOiUsd !== undefined && q.minOiUsd !== "" ? Number(q.minOiUsd) : 1_000_000;
+    if (!Number.isFinite(minOiUsd)) return bad(reply, "invalid minOiUsd");
+    const minVolumeUsd = q.minVolumeUsd !== undefined && q.minVolumeUsd !== "" ? Number(q.minVolumeUsd) : 1_000_000;
+    if (!Number.isFinite(minVolumeUsd)) return bad(reply, "invalid minVolumeUsd");
+
+    const bundle = await getChanges(windowMs);
+    if (!bundle.asOf) return noRecentData(reply);
+    const sign = dir === "desc" ? -1 : 1;
+    const ranked = bundle.rows
+      .filter((r) => (r.oiUsd ?? 0) >= minOiUsd && (r.dayNtlVlm ?? 0) >= minVolumeUsd && sorter(r) !== null)
+      .sort((a, b) => (sorter(a)! - sorter(b)!) * sign || a.coin.localeCompare(b.coin))
+      .slice(0, limit);
+
+    const recaps = await Promise.all(
+      ranked.map(async (r, i) => {
+        const asset = await resolveCoin(r.coin);
+        if (!asset) return null;
+        const recap = await cached(`recap:${asset.coin}:${windowMs}`, CACHE_MS, () => buildRecap(asset, windowRaw, windowMs));
+        if (!recap.ok) return null;
+        return { rank: i + 1, rankedBy: sortRaw, rankValuePct: sorter(r), ...recap.body };
+      }),
+    );
+    const data = recaps.filter((r): r is NonNullable<typeof r> => r !== null);
+    return {
+      window: windowRaw,
+      asOf: bundle.asOf,
+      sort: sortRaw,
+      dir,
+      minOiUsd,
+      minVolumeUsd,
+      eligible: bundle.rows.filter((r) => (r.oiUsd ?? 0) >= minOiUsd && (r.dayNtlVlm ?? 0) >= minVolumeUsd).length,
       count: data.length,
       data,
     };
