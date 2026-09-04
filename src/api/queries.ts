@@ -74,7 +74,9 @@ export interface ChangeRow {
   fundingHrThen: number | null;
   fundingAprPct: number | null;
   markPx: number | null;
-  dayNtlVlm: number | null;
+  dayNtlVlm: number | null; // HL's rolling 24h notional volume, now
+  dayNtlVlmThen: number | null; // the same rolling figure as of the window start
+  dayNtlVlmChangePct: number | null; // change in rolling 24h volume over the window
   hl24hChangePct: number | null; // HL's own 24h change (px vs prevDayPx), for reference
   thenTs: string | null;
 }
@@ -106,6 +108,8 @@ export async function changesBundle(windowMs: number): Promise<ChangesBundle> {
       fundingAprPct: n.funding_hr !== null ? aprPct(n.funding_hr) : null,
       markPx: n.mark_px,
       dayNtlVlm: n.day_ntl_vlm,
+      dayNtlVlmThen: t?.day_ntl_vlm ?? null,
+      dayNtlVlmChangePct: pctChange(n.day_ntl_vlm, t?.day_ntl_vlm ?? null),
       hl24hChangePct: pctChange(n.px, n.prev_day_px),
       thenTs: t ? t.ts.toISOString() : null,
     };
@@ -495,25 +499,31 @@ export interface LiqTotalsRow {
   coin: string;
   long_ntl: number;
   short_ntl: number;
-  long_events: number;
+  long_events: number; // forced orders (distinct wallet × timestamp)
   short_events: number;
-  long_fills: number;
+  long_fills: number; // raw prints
   short_fills: number;
-  traders: number; // distinct wallets liquidated
+  long_traders: number; // distinct wallets liquidated on that side
+  short_traders: number;
+  traders: number; // distinct wallets liquidated either side (≤ long + short: one wallet can be hit both ways)
 }
+
+const LIQ_TOTAL_COLS = `
+  coalesce(sum(ntl) filter (where side = 'long'), 0) as long_ntl,
+  coalesce(sum(ntl) filter (where side = 'short'), 0) as short_ntl,
+  (count(distinct (wallet, ts)) filter (where side = 'long'))::int as long_events,
+  (count(distinct (wallet, ts)) filter (where side = 'short'))::int as short_events,
+  (count(*) filter (where side = 'long'))::int as long_fills,
+  (count(*) filter (where side = 'short'))::int as short_fills,
+  (count(distinct wallet) filter (where side = 'long'))::int as long_traders,
+  (count(distinct wallet) filter (where side = 'short'))::int as short_traders,
+  count(distinct wallet)::int as traders`;
 
 // Per-coin liquidation totals over a trailing window, from raw fills (exact windows,
 // bounded by LIQ_RETENTION_DAYS). coin = null returns every coin with liquidations.
 export async function liqTotals(windowMs: number, coin: string | null): Promise<LiqTotalsRow[]> {
   const { rows } = await pool.query<LiqTotalsRow>(
-    `select coin,
-       coalesce(sum(ntl) filter (where side = 'long'), 0) as long_ntl,
-       coalesce(sum(ntl) filter (where side = 'short'), 0) as short_ntl,
-       (count(distinct (wallet, ts)) filter (where side = 'long'))::int as long_events,
-       (count(distinct (wallet, ts)) filter (where side = 'short'))::int as short_events,
-       (count(*) filter (where side = 'long'))::int as long_fills,
-       (count(*) filter (where side = 'short'))::int as short_fills,
-       count(distinct wallet)::int as traders
+    `select coin, ${LIQ_TOTAL_COLS}
      from liq_fills
      where ts >= now() - make_interval(secs => $1) and ($2::text is null or coin = $2)
      group by coin`,
@@ -522,14 +532,16 @@ export async function liqTotals(windowMs: number, coin: string | null): Promise<
   return rows;
 }
 
-// Distinct wallets liquidated venue-wide over a trailing window. Not the sum of the
-// per-coin counts: one wallet liquidated on BTC and ETH in a cascade is one trader.
-export async function liqVenueTraders(windowMs: number): Promise<number> {
-  const { rows } = await pool.query<{ n: number }>(
-    `select count(distinct wallet)::int as n from liq_fills where ts >= now() - make_interval(secs => $1)`,
+// Venue-wide totals over a trailing window. Not derivable from the per-coin rows:
+// distinct wallets don't sum across coins (one trader liquidated in BTC and ETH is one trader).
+export async function liqVenueTotals(windowMs: number): Promise<LiqTotalsRow> {
+  const { rows } = await pool.query<LiqTotalsRow>(
+    `select '*' as coin, ${LIQ_TOTAL_COLS}
+     from liq_fills
+     where ts >= now() - make_interval(secs => $1)`,
     [windowMs / 1000],
   );
-  return rows[0]?.n ?? 0;
+  return rows[0]!;
 }
 
 export interface LiqLargestRow {

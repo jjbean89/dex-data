@@ -134,16 +134,17 @@ Deploys are zero-drama: the collector shuts down gracefully on SIGTERM and the D
 All responses are JSON (gzip-compressed when the client sends `Accept-Encoding: gzip`), CORS `*`, UTC timestamps (ISO + `tMs` epoch millis on series). Errors: `{"error":{"code","message"}}` with 400/404/503. Funding rates are **hourly decimals** (`0.0000125` = 0.00125%/hr ≈ 10.95% APR — `aprPct` fields do the conversion). OI is reported in coins (`openInterest`) and USD (`oiUsd` = OI × mark price).
 
 ### `GET /v1/perps/changes?window=1h`
-The headline endpoint: price, OI, and funding change over any window for every coin, sorted. Params: `window` (`5m`…`14d`, rolling, default `1h`), `sort` (`px|oi|funding|volume`), `dir`, `limit`, `minOiUsd` (filter dust).
+The headline endpoint: price, OI, funding, and volume change over any window for every coin, sorted. Params: `window` (`5m`…`14d`, rolling, default `1h`), `sort` (`px|oi|funding|volume|volumeChange` — `volume` ranks by current 24h volume, `volumeChange` by its change over the window), `dir`, `limit`, `minOiUsd` and `minVolumeUsd` (filter dust; both in USD).
 
 ```json
 { "window": "1h", "asOf": "2026-08-26T15:18:18.354Z", "toleranceSec": 180, "count": 2,
   "data": [{ "coin": "BTC", "px": 77752.5, "pxThen": 76195.49, "pxChangePct": 2.04,
              "oiUsd": 2959237278.4, "oiUsdThen": 2755498389.0, "oiUsdChangePct": 7.39,
              "fundingHr": 0.0000125, "fundingHrThen": 0.00000625, "fundingAprPct": 10.95,
-             "dayNtlVlm": 3840737419.7, "hl24hChangePct": -1.67, "thenTs": "2026-08-26T14:17:33.462Z" }] }
+             "dayNtlVlm": 3840737419.7, "dayNtlVlmThen": 3512004180.2, "dayNtlVlmChangePct": 9.36,
+             "hl24hChangePct": -1.67, "thenTs": "2026-08-26T14:17:33.462Z" }] }
 ```
-"Then" is the recorded tick nearest to `now - window` (±5% of the window, clamped 90s–15min; reported as `toleranceSec`). Missing coverage → `null` changes, never fabricated values.
+"Then" is the recorded tick nearest to `now - window` (±5% of the window, clamped 90s–15min; reported as `toleranceSec`). Missing coverage → `null` changes, never fabricated values. `dayNtlVlm` is Hyperliquid's rolling 24h notional volume, so `dayNtlVlmChangePct` over a 24h window compares today's 24h volume with the previous day's — "which coins are trading the most more than yesterday" (e.g. `?window=24h&sort=volumeChange&minOiUsd=1000000&minVolumeUsd=1000000&limit=5`).
 
 ### `GET /v1/perps/emas` · `GET /v1/perps/:coin/emas`
 **The EMA board for your app in one request**: every live coin × timeframe × period, computed from Hyperliquid's official candles and joined with the live price. Per timeframe you get the raw EMAs plus the screener columns — `pxVsEmaPct` (% distance of the current price from each EMA) and `spreadPct` (fastest EMA vs slowest, the "cross" column: positive = 21 above 200, a sign flip = golden/death cross). Params: `tf` (comma list to subset timeframes), `coins` (comma list), `minOiUsd`, `limit`. Sorted by OI descending.
@@ -181,8 +182,8 @@ Universe list (sorted by OI) and a single-coin snapshot with `changes` for 1h/4h
                     "windowHigh": { "usd": 530000000, "at": "..." }, "windowLow": { "usd": 390000000, "at": "..." },
                     "record": { "usd": 530000000, "at": "2026-09-03T06:00:00.000Z", "coins": 700000, "coinsAt": "...",
                                 "isRecordHigh": true, "pctBelowRecord": 1.89, "recordedSince": "2026-08-24T18:00:00.000Z", "recordedDays": 10 } },
-  "liquidations": { "longs": { "ntlUsd": 199800, "events": 1, "fills": 1 }, "shorts": { "ntlUsd": 2461000, "events": 2, "fills": 3 },
-                    "totalNtlUsd": 2660800, "events": 3, "shortSharePct": 92.5, "dominantSide": "shorts" },
+  "liquidations": { "longs": { "ntlUsd": 199800, "events": 1, "fills": 1, "traders": 1 }, "shorts": { "ntlUsd": 2461000, "events": 2, "fills": 3, "traders": 2 },
+                    "totalNtlUsd": 2660800, "events": 3, "traders": 3, "shortSharePct": 92.5, "dominantSide": "shorts" },
   "positioning": { "nLong": 1140, "nShort": 760, "nTraders": 1900, "pctLong": 60.0, "ntlLongUsd": 300000000, "ntlShortUsd": 180000000,
                    "entries": { "avgEntryLong": 812.4, "avgEntryShort": 941.7, "longsInProfit": 1102, "longsUnderwater": 38,
                                 "shortsInProfit": 12, "shortsUnderwater": 748, "pctLongsInProfit": 96.7, "pctShortsInProfit": 1.6,
@@ -196,12 +197,22 @@ Universe list (sorted by OI) and a single-coin snapshot with `changes` for 1h/4h
 ```
 
 Where each block comes from, and what the flags mean:
-- **`liquidations`** — exact trailing-window totals from raw fills (same numbers as `/v1/perps/liquidations`). `dominantSide` is `shorts`/`longs` when one side is ≥ 60% of liquidated notional, else `balanced` (`none` when nothing was liquidated).
+- **`liquidations`** — exact trailing-window totals from raw fills (same numbers as `/v1/perps/liquidations`): `ntlUsd`, `events` (forced orders), `fills` (raw prints), and `traders` (distinct wallets liquidated — the "how many traders got liquidated" number; a trader hit several times counts once, and the top-level `traders` can be less than longs + shorts because one wallet can be liquidated both ways in a window). `dominantSide` is `shorts`/`longs` when one side is ≥ 60% of liquidated notional, else `balanced` (`none` when nothing was liquidated).
 - **`price` / `openInterest` change** — now vs. the recorded tick nearest `now − window`, identical to `/changes` (so `null` until the window has history). `windowHigh`/`windowLow` come from the 5m candles plus the live tick.
 - **`allTimeHigh`** — from Hyperliquid's own daily candles (the full listing history, fetched once per coin per 5 minutes; `null` if the fetch fails or the coin has no candles). `isNewInWindow` is true when a high above every prior high printed inside the window; the pre-window part of the day that straddles the window start is resolved from our 5m candles, so a window shorter than a day still gets a precise answer. `pctBelowAth` is the current price's distance from the high (`0` = at the high); `flags.nearAllTimeHigh` = within 5%.
 - **`openInterest.record`** — the highest OI **this service has recorded** (1h candles are kept forever, so the record deepens the longer the collector runs — `recordedSince`/`recordedDays` say how deep it is). `isRecordHigh` is true when that record was set inside the window — the "open interest reaches its highest level on Hyperliquid" claim.
 - **`positioning`** — the long/short trader counts now vs. the snapshot nearest `now − window`, with count and notional deltas (`nLongChangePct` is the "longs increased by X%" number). `entries` carries the size-weighted average entry price per side and how many positions with a known entry are in profit at that snapshot's price (same fields as `/positioning`; `null` on backfilled rows), and `changes` adds the average-entry drift over the window — a rising long average entry with a stable count means late buyers, not a bigger crowd. `null` while the tracker is warming up or when `POSITIONS_ENABLED=false`; `changes` is `null` when no snapshot exists that far back.
 - **`flags`** — the booleans behind the usual claims (`newAllTimeHigh`, `nearAllTimeHigh`, `oiRecordHigh`, `liquidationsSide`, `longsIncreased`), `null` where the underlying block is. Change fields are `null` rather than fabricated when the window has no history yet, so check for `null` before writing a direction.
+
+### `GET /v1/perps/recaps?window=24h&sort=oi&limit=5`
+**The movers feed** — rank every coin by change over the window, take the top N, and return each one's full `/recap` payload in a single response: "the five biggest open-interest gainers today, and what happened to each". Params: `window` (default `24h`), `sort` (`oi` = OI change %, `volumeChange` = 24h-volume change %, `px` = price change %; default `oi`), `dir` (default `desc`), `limit` (default 5, max 20), `minOiUsd` and `minVolumeUsd` (**default $1,000,000 each** — pass `0` to lift them). Coins with no reading for the sort key (a listing younger than the window) are skipped.
+
+```json
+{ "window": "24h", "asOf": "2026-09-04T00:28:05.755Z", "sort": "oi", "dir": "desc",
+  "minOiUsd": 1000000, "minVolumeUsd": 1000000, "eligible": 69, "count": 5,
+  "data": [{ "rank": 1, "rankedBy": "oi", "rankValuePct": 263.5, "coin": "AZTEC", "...": "full /recap payload" },
+           { "rank": 2, "rankedBy": "oi", "rankValuePct": 99.9, "coin": "PONS", "...": "" }] }
+```
 
 ### `GET /v1/perps/:coin/candles?interval=5m|1h|1d`
 OHLC candles **of both price and open interest** rolled up from recorded ticks — this is the per-coin OI chart feed. Params: `from`, `to` (epoch ms/s or ISO), `limit` (default 300, max 5000; most recent within range, ascending). Each row: `mid {o,h,l,c}`, `oi {o,h,l,c}` (coins), `oiUsd {o,h,l,c}`, `markC`, `oracleC`, `fundingHr`, `premiumAvg`, `dayNtlVlm`, `nTicks`.
@@ -254,12 +265,12 @@ Honest semantics — read this before charting it:
 ```
 
 ### `GET /v1/perps/liquidations?windows=1h,4h,12h,24h`
-**The liquidation board** — per-coin totals over trailing windows plus the venue-wide sum, in one response: everything a "liquidation heatmap" page needs (treemap sized by notional and coloured by long/short, the 1h/4h/12h/24h "Rekt" cards, traders liquidated, the largest single order) plus a ready-made one-line narrative per coin and window. Params: `windows` (comma list, `15m`…`{LIQ_RETENTION_DAYS}d`, default `1h,24h`), `sort` (`ntl|events`, applied to the first window), `dir`, `limit`. Windows are computed exactly from raw fills, not bucket-aligned.
+**The liquidation board** — per-coin totals over trailing windows plus the venue-wide sum, in one response: everything a "liquidation heatmap" page needs (treemap sized by notional and coloured by long/short, the 1h/4h/12h/24h "Rekt" cards, traders liquidated, the largest single order) plus a ready-made one-line narrative per coin and window. Params: `windows` (comma list, `15m`…`{LIQ_RETENTION_DAYS}d`, default `1h,24h`), `sort` (`ntl|events`, applied to the first window), `dir`, `limit`. Windows are computed exactly from raw fills, not bucket-aligned. Each side block carries `ntlUsd`, `events` (forced orders), `fills` (raw prints), and `traders` (distinct wallets liquidated on that side).
 
 ```json
 { "windows": ["1h", "24h"], "lastLiqAt": "2026-08-30T17:09:58.664Z", "count": 37,
-  "totals": { "1h":  { "longs": { "ntlUsd": 1160000, "events": 12, "fills": 31 },
-                        "shorts": { "ntlUsd": 4650000, "events": 155, "fills": 640 },
+  "totals": { "1h":  { "longs": { "ntlUsd": 1160000, "events": 12, "fills": 31, "traders": 11 },
+                        "shorts": { "ntlUsd": 4650000, "events": 155, "fills": 640, "traders": 178 },
                         "totalNtlUsd": 5810000, "events": 167, "traders": 187,
                         "largest": { "coin": "BTC", "ntlUsd": 1240000, "side": "short", "px": 63210.5, "fills": 6,
                                      "wallet": "0x…", "explorer": "https://app.hyperliquid.xyz/explorer/address/0x…",
@@ -277,7 +288,7 @@ Honest semantics — read this before charting it:
 Per coin and window: `traders` is the number of distinct wallets liquidated (in `totals` it is venue-wide distinct wallets, not the sum — one wallet liquidated on BTC and ETH in a cascade is one trader); `largest` is the single biggest forced liquidation order (all fills of one forced order share a wallet and timestamp; `px` is the notional-weighted fill price; `null` when nothing was liquidated); `px` is the coin's price move over the same window from the recorded ticks (`null` for windows longer than `RAW_RETENTION_DAYS`, where no reference tick survives); `headline` is the narrative string — the dominant side leads, the other side is added when it is at least a quarter of the total, and the move is included when known. It says *liquidated*, not "stopped or liquidated": stop orders are private and nothing public distinguishes a stop-out from any other trade. All numbers are the recorder's floors (see coverage notes below).
 
 ### `GET /v1/perps/:coin/liquidations/recent` · `GET /v1/market/liquidations/recent`
-The raw liquidation tape, newest first: `{t, side, px, sz, ntlUsd, wallet, method, tid}` (`side` = which side got liquidated; `wallet` = the liquidated address — public on-chain data; `method` = `market` for order-book liquidations, `backstop` for liquidator-vault takeovers). `/v1/perps/:coin` also carries a `liquidations` block with 1h/24h totals (including `traders`) inline.
+The raw liquidation tape, newest first: `{t, side, px, sz, ntlUsd, wallet, method, tid}` (`side` = which side got liquidated; `wallet` = the liquidated address — public on-chain data; `method` = `market` for order-book liquidations, `backstop` for liquidator-vault takeovers). `/v1/perps/:coin` also carries a `liquidations` block with 1h/24h totals inline (notional, forced orders, fills, and distinct traders, per side and overall).
 
 How this works — and its honest semantics (Hyperliquid has **no** liquidation feed):
 - **Detection.** Forced closes print on the public trades WebSocket looking exactly like normal trades (same shape, real hash — verified empirically; the all-zero-hash prints are TWAP fills, not liquidations). But a wallet's fills from `userFillsByTime` carry an explicit `liquidation` marker on **both parties** of a liquidation print, naming the liquidated wallet. So the recorder classifies tape trades by verifying wallets: one paced request classifies *every* trade that wallet touched in the window.
