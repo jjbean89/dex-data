@@ -205,11 +205,11 @@ Where each block comes from, and what the flags mean:
 - **`flags`** — the booleans behind the usual claims (`newAllTimeHigh`, `nearAllTimeHigh`, `oiRecordHigh`, `liquidationsSide`, `longsIncreased`), `null` where the underlying block is. Change fields are `null` rather than fabricated when the window has no history yet, so check for `null` before writing a direction.
 
 ### `GET /v1/perps/recaps?window=24h&sort=oi&limit=5`
-**The movers feed** — rank every coin by change over the window, take the top N, and return each one's full `/recap` payload in a single response: "the five biggest open-interest gainers today, and what happened to each". Params: `window` (default `24h`), `sort` (`oi` = OI change %, `volumeChange` = 24h-volume change %, `px` = price change %; default `oi`), `dir` (default `desc`), `limit` (default 5, max 20), `minOiUsd` and `minVolumeUsd` (**default $1,000,000 each** — pass `0` to lift them). Coins with no reading for the sort key (a listing younger than the window) are skipped.
+**The movers feed** — rank every coin by change over the window, take the top N, and return each one's full `/recap` payload in a single response: "the five biggest open-interest gainers today, and what happened to each". Params: `window` (default `24h`), `sort` (`oi` = OI change %, `volumeChange` = 24h-volume change %, `px` = price change %; default `oi`), `dir` (default `desc`), `limit` (default 5, max 20), and three floors applied to current values: `minOiUsd` (**default $5,000,000**), `minVolumeUsd` (24h volume, **default $1,000,000**), `minLiqUsd` (notional liquidated over the window, both sides, **default $500,000**) — pass `0` to lift any of them. Coins with no reading for the sort key (a listing younger than the window) are skipped; `eligible` reports how many coins passed the floors.
 
 ```json
 { "window": "24h", "asOf": "2026-09-04T00:28:05.755Z", "sort": "oi", "dir": "desc",
-  "minOiUsd": 1000000, "minVolumeUsd": 1000000, "eligible": 69, "count": 5,
+  "minOiUsd": 5000000, "minVolumeUsd": 1000000, "minLiqUsd": 500000, "eligible": 9, "count": 5,
   "data": [{ "rank": 1, "rankedBy": "oi", "rankValuePct": 263.5, "coin": "AZTEC", "...": "full /recap payload" },
            { "rank": 2, "rankedBy": "oi", "rankValuePct": 99.9, "coin": "PONS", "...": "" }] }
 ```
