@@ -7,7 +7,7 @@ import { VOL_TABLES, listVolSignals, oiUsdAt, volCandles, volumeContext, volumeM
 import {
   LATEST_MAX_AGE_MS,
   LIQ_BUCKET_MS,
-  changesBundle,
+  changesBundleCached,
   emaStates,
   emaStatesFor,
   fundingRows,
@@ -52,6 +52,7 @@ import {
 } from "./queries.js";
 import { serializeWhaleCoin, whaleHeadline } from "../collector/liq-whales.js";
 import { formatUsd } from "../collector/webhook.js";
+import { buildRecap } from "./recap.js";
 import { aprPct, cached, parseLimit, parseTimeMs, parseWindow, pctChange, rollingMean } from "./util.js";
 
 type Query = Record<string, string | undefined>;
@@ -89,7 +90,7 @@ function positioningWarmingUp(
 }
 
 function getChanges(windowMs: number): Promise<ChangesBundle> {
-  return cached(`changes:${windowMs}`, CACHE_MS, () => changesBundle(windowMs));
+  return changesBundleCached(windowMs);
 }
 
 // Resolves interval/from/to/limit query params shared by the candle endpoints.
@@ -666,6 +667,7 @@ export function registerRoutes(app: FastifyInstance): void {
       "GET /v1/perps/changes?window=1h&sort=px|oi|funding|volume&dir=desc&limit=50&minOiUsd=0",
       "GET /v1/perps/emas?tf=1h,4h,12h,1d&coins=&minOiUsd=0&limit=500",
       "GET /v1/perps/:coin",
+      "GET /v1/perps/:coin/recap?window=24h",
       "GET /v1/perps/:coin/emas",
       "GET /v1/perps/:coin/candles?interval=5m|1h|1d&from=&to=&limit=300",
       "GET /v1/perps/:coin/funding-history?from=&to=&limit=168",
@@ -1238,6 +1240,27 @@ export function registerRoutes(app: FastifyInstance): void {
     if (limit === null) return bad(reply, "invalid limit");
     const rows = await recentLiqFills(asset.coin, limit);
     return { coin: asset.coin, count: rows.length, data: rows.map((r) => serializeLiqFill(r, false)) };
+  });
+
+  // The ticker recap: liquidations by side, price change + all-time-high check,
+  // OI change + record-high check, and long/short trader deltas over one trailing
+  // window — the numbers a ticker line is written from, in one request.
+  app.get("/v1/perps/:coin/recap", async (req, reply) => {
+    const { coin: coinRaw } = req.params as { coin: string };
+    const asset = await resolveCoin(coinRaw);
+    if (!asset) return notFound(reply, `no perp named "${coinRaw}"`);
+    const q = req.query as Query;
+    const windowRaw = q.window ?? "24h";
+    const windowMs = parseWindow(windowRaw);
+    if (windowMs === null) return bad(reply, `invalid window "${windowRaw}" — use e.g. 1h, 4h, 24h, 7d`);
+    if (windowMs < 5 * 60_000) return bad(reply, "window must be at least 5m");
+    const maxDays = Math.min(config.rawRetentionDays, config.liqRetentionDays);
+    if (windowMs > maxDays * 86_400_000) {
+      return bad(reply, `window exceeds raw tick retention (${maxDays}d) — use the candle endpoints for longer ranges`);
+    }
+    const recap = await cached(`recap:${asset.coin}:${windowMs}`, CACHE_MS, () => buildRecap(asset, windowRaw, windowMs));
+    if (!recap.ok) return noRecentData(reply);
+    return recap.body;
   });
 
   app.get("/v1/perps/:coin", async (req, reply) => {
