@@ -74,7 +74,9 @@ export interface ChangeRow {
   fundingHrThen: number | null;
   fundingAprPct: number | null;
   markPx: number | null;
-  dayNtlVlm: number | null;
+  dayNtlVlm: number | null; // HL's rolling 24h notional volume, now
+  dayNtlVlmThen: number | null; // the same rolling figure as of the window start
+  dayNtlVlmChangePct: number | null; // change in rolling 24h volume over the window
   hl24hChangePct: number | null; // HL's own 24h change (px vs prevDayPx), for reference
   thenTs: string | null;
 }
@@ -106,6 +108,8 @@ export async function changesBundle(windowMs: number): Promise<ChangesBundle> {
       fundingAprPct: n.funding_hr !== null ? aprPct(n.funding_hr) : null,
       markPx: n.mark_px,
       dayNtlVlm: n.day_ntl_vlm,
+      dayNtlVlmThen: t?.day_ntl_vlm ?? null,
+      dayNtlVlmChangePct: pctChange(n.day_ntl_vlm, t?.day_ntl_vlm ?? null),
       hl24hChangePct: pctChange(n.px, n.prev_day_px),
       thenTs: t ? t.ts.toISOString() : null,
     };

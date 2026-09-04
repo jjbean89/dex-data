@@ -585,7 +585,7 @@ export function registerRoutes(app: FastifyInstance): void {
     endpoints: [
       "GET /health",
       "GET /v1/perps",
-      "GET /v1/perps/changes?window=1h&sort=px|oi|funding|volume&dir=desc&limit=50&minOiUsd=0",
+      "GET /v1/perps/changes?window=1h&sort=px|oi|funding|volume|volumeChange&dir=desc&limit=50&minOiUsd=0&minVolumeUsd=0",
       "GET /v1/perps/emas?tf=1h,4h,12h,1d&coins=&minOiUsd=0&limit=500",
       "GET /v1/perps/:coin",
       "GET /v1/perps/:coin/recap?window=24h",
@@ -882,22 +882,25 @@ export function registerRoutes(app: FastifyInstance): void {
       oi: (r) => r.oiUsdChangePct,
       funding: (r) => r.fundingHr,
       volume: (r) => r.dayNtlVlm,
+      volumeChange: (r) => r.dayNtlVlmChangePct,
     };
     const sortRaw = q.sort ?? "px";
     const sorter = sorters[sortRaw];
-    if (!sorter) return bad(reply, `invalid sort "${sortRaw}" — use px|oi|funding|volume`);
+    if (!sorter) return bad(reply, `invalid sort "${sortRaw}" — use px|oi|funding|volume|volumeChange`);
     const dir = q.dir ?? "desc";
     if (dir !== "asc" && dir !== "desc") return bad(reply, 'dir must be "asc" or "desc"');
     const limit = parseLimit(q.limit, 500, 500);
     if (limit === null) return bad(reply, "invalid limit");
     const minOiUsd = q.minOiUsd !== undefined && q.minOiUsd !== "" ? Number(q.minOiUsd) : 0;
     if (!Number.isFinite(minOiUsd)) return bad(reply, "invalid minOiUsd");
+    const minVolumeUsd = q.minVolumeUsd !== undefined && q.minVolumeUsd !== "" ? Number(q.minVolumeUsd) : 0;
+    if (!Number.isFinite(minVolumeUsd)) return bad(reply, "invalid minVolumeUsd");
 
     const bundle = await getChanges(windowMs);
     if (!bundle.asOf) return noRecentData(reply);
     const sign = dir === "desc" ? -1 : 1;
     const data = bundle.rows
-      .filter((r) => (r.oiUsd ?? 0) >= minOiUsd)
+      .filter((r) => (r.oiUsd ?? 0) >= minOiUsd && (r.dayNtlVlm ?? 0) >= minVolumeUsd)
       .sort((a, b) => {
         const av = sorter(a);
         const bv = sorter(b);

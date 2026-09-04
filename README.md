@@ -134,16 +134,17 @@ Deploys are zero-drama: the collector shuts down gracefully on SIGTERM and the D
 All responses are JSON (gzip-compressed when the client sends `Accept-Encoding: gzip`), CORS `*`, UTC timestamps (ISO + `tMs` epoch millis on series). Errors: `{"error":{"code","message"}}` with 400/404/503. Funding rates are **hourly decimals** (`0.0000125` = 0.00125%/hr ≈ 10.95% APR — `aprPct` fields do the conversion). OI is reported in coins (`openInterest`) and USD (`oiUsd` = OI × mark price).
 
 ### `GET /v1/perps/changes?window=1h`
-The headline endpoint: price, OI, and funding change over any window for every coin, sorted. Params: `window` (`5m`…`14d`, rolling, default `1h`), `sort` (`px|oi|funding|volume`), `dir`, `limit`, `minOiUsd` (filter dust).
+The headline endpoint: price, OI, funding, and volume change over any window for every coin, sorted. Params: `window` (`5m`…`14d`, rolling, default `1h`), `sort` (`px|oi|funding|volume|volumeChange` — `volume` ranks by current 24h volume, `volumeChange` by its change over the window), `dir`, `limit`, `minOiUsd` and `minVolumeUsd` (filter dust; both in USD).
 
 ```json
 { "window": "1h", "asOf": "2026-08-26T15:18:18.354Z", "toleranceSec": 180, "count": 2,
   "data": [{ "coin": "BTC", "px": 77752.5, "pxThen": 76195.49, "pxChangePct": 2.04,
              "oiUsd": 2959237278.4, "oiUsdThen": 2755498389.0, "oiUsdChangePct": 7.39,
              "fundingHr": 0.0000125, "fundingHrThen": 0.00000625, "fundingAprPct": 10.95,
-             "dayNtlVlm": 3840737419.7, "hl24hChangePct": -1.67, "thenTs": "2026-08-26T14:17:33.462Z" }] }
+             "dayNtlVlm": 3840737419.7, "dayNtlVlmThen": 3512004180.2, "dayNtlVlmChangePct": 9.36,
+             "hl24hChangePct": -1.67, "thenTs": "2026-08-26T14:17:33.462Z" }] }
 ```
-"Then" is the recorded tick nearest to `now - window` (±5% of the window, clamped 90s–15min; reported as `toleranceSec`). Missing coverage → `null` changes, never fabricated values.
+"Then" is the recorded tick nearest to `now - window` (±5% of the window, clamped 90s–15min; reported as `toleranceSec`). Missing coverage → `null` changes, never fabricated values. `dayNtlVlm` is Hyperliquid's rolling 24h notional volume, so `dayNtlVlmChangePct` over a 24h window compares today's 24h volume with the previous day's — "which coins are trading the most more than yesterday" (e.g. `?window=24h&sort=volumeChange&minOiUsd=1000000&minVolumeUsd=1000000&limit=5`).
 
 ### `GET /v1/perps/emas` · `GET /v1/perps/:coin/emas`
 **The EMA board for your app in one request**: every live coin × timeframe × period, computed from Hyperliquid's official candles and joined with the live price. Per timeframe you get the raw EMAs plus the screener columns — `pxVsEmaPct` (% distance of the current price from each EMA) and `spreadPct` (fastest EMA vs slowest, the "cross" column: positive = 21 above 200, a sign flip = golden/death cross). Params: `tf` (comma list to subset timeframes), `coins` (comma list), `minOiUsd`, `limit`. Sorted by OI descending.
