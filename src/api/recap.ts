@@ -315,11 +315,11 @@ export async function buildRecap(asset: AssetRow, windowName: string, windowMs: 
   const dominantSide: "shorts" | "longs" | "balanced" | "none" =
     totalNtl === 0 ? "none" : shortShare! >= DOMINANT_SHARE_PCT ? "shorts" : shortShare! <= 100 - DOMINANT_SHARE_PCT ? "longs" : "balanced";
   const liquidations = {
-    longs: { ntlUsd: longNtl, events: l?.long_events ?? 0, fills: l?.long_fills ?? 0, wallets: l?.long_wallets ?? 0 },
-    shorts: { ntlUsd: shortNtl, events: l?.short_events ?? 0, fills: l?.short_fills ?? 0, wallets: l?.short_wallets ?? 0 },
+    longs: { ntlUsd: longNtl, events: l?.long_events ?? 0, fills: l?.long_fills ?? 0, traders: l?.long_traders ?? 0 },
+    shorts: { ntlUsd: shortNtl, events: l?.short_events ?? 0, fills: l?.short_fills ?? 0, traders: l?.short_traders ?? 0 },
     totalNtlUsd: totalNtl,
     events: (l?.long_events ?? 0) + (l?.short_events ?? 0),
-    wallets: l?.wallets ?? 0, // distinct traders liquidated (either side)
+    traders: l?.traders ?? 0, // distinct wallets liquidated (either side)
     shortSharePct: shortShare,
     dominantSide,
   };

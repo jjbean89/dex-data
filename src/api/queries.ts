@@ -503,9 +503,9 @@ export interface LiqTotalsRow {
   short_events: number;
   long_fills: number; // raw prints
   short_fills: number;
-  long_wallets: number; // distinct traders liquidated on that side
-  short_wallets: number;
-  wallets: number; // distinct traders either side (≤ long + short: one wallet can be hit both ways)
+  long_traders: number; // distinct wallets liquidated on that side
+  short_traders: number;
+  traders: number; // distinct wallets liquidated either side (≤ long + short: one wallet can be hit both ways)
 }
 
 const LIQ_TOTAL_COLS = `
@@ -515,9 +515,9 @@ const LIQ_TOTAL_COLS = `
   (count(distinct (wallet, ts)) filter (where side = 'short'))::int as short_events,
   (count(*) filter (where side = 'long'))::int as long_fills,
   (count(*) filter (where side = 'short'))::int as short_fills,
-  (count(distinct wallet) filter (where side = 'long'))::int as long_wallets,
-  (count(distinct wallet) filter (where side = 'short'))::int as short_wallets,
-  count(distinct wallet)::int as wallets`;
+  (count(distinct wallet) filter (where side = 'long'))::int as long_traders,
+  (count(distinct wallet) filter (where side = 'short'))::int as short_traders,
+  count(distinct wallet)::int as traders`;
 
 // Per-coin liquidation totals over a trailing window, from raw fills (exact windows,
 // bounded by LIQ_RETENTION_DAYS). coin = null returns every coin with liquidations.
@@ -542,6 +542,32 @@ export async function liqVenueTotals(windowMs: number): Promise<LiqTotalsRow> {
     [windowMs / 1000],
   );
   return rows[0]!;
+}
+
+export interface LiqLargestRow {
+  coin: string;
+  wallet: string;
+  ts: Date;
+  side: string;
+  ntl: number;
+  px: number; // notional-weighted fill price
+  fills: number;
+}
+
+// Per coin, the single largest forced liquidation order in the window — one forced
+// order is every fill sharing (wallet, ts). The venue-wide largest is the max of these.
+export async function liqLargestOrders(windowMs: number): Promise<LiqLargestRow[]> {
+  const { rows } = await pool.query<LiqLargestRow>(
+    `select distinct on (coin) coin, wallet, ts, side, ntl, px, fills from (
+       select coin, wallet, ts, min(side) as side, sum(ntl) as ntl,
+              sum(ntl) / nullif(sum(sz), 0) as px, count(*)::int as fills
+       from liq_fills
+       where ts >= now() - make_interval(secs => $1)
+       group by coin, wallet, ts
+     ) o order by coin, ntl desc, ts desc`,
+    [windowMs / 1000],
+  );
+  return rows;
 }
 
 export interface LiqFillRow {

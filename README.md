@@ -182,8 +182,8 @@ Universe list (sorted by OI) and a single-coin snapshot with `changes` for 1h/4h
                     "windowHigh": { "usd": 530000000, "at": "..." }, "windowLow": { "usd": 390000000, "at": "..." },
                     "record": { "usd": 530000000, "at": "2026-09-03T06:00:00.000Z", "coins": 700000, "coinsAt": "...",
                                 "isRecordHigh": true, "pctBelowRecord": 1.89, "recordedSince": "2026-08-24T18:00:00.000Z", "recordedDays": 10 } },
-  "liquidations": { "longs": { "ntlUsd": 199800, "events": 1, "fills": 1, "wallets": 1 }, "shorts": { "ntlUsd": 2461000, "events": 2, "fills": 3, "wallets": 2 },
-                    "totalNtlUsd": 2660800, "events": 3, "wallets": 3, "shortSharePct": 92.5, "dominantSide": "shorts" },
+  "liquidations": { "longs": { "ntlUsd": 199800, "events": 1, "fills": 1, "traders": 1 }, "shorts": { "ntlUsd": 2461000, "events": 2, "fills": 3, "traders": 2 },
+                    "totalNtlUsd": 2660800, "events": 3, "traders": 3, "shortSharePct": 92.5, "dominantSide": "shorts" },
   "positioning": { "nLong": 1140, "nShort": 760, "nTraders": 1900, "pctLong": 60.0, "ntlLongUsd": 300000000, "ntlShortUsd": 180000000,
                    "entries": { "avgEntryLong": 812.4, "avgEntryShort": 941.7, "longsInProfit": 1102, "longsUnderwater": 38,
                                 "shortsInProfit": 12, "shortsUnderwater": 748, "pctLongsInProfit": 96.7, "pctShortsInProfit": 1.6,
@@ -197,7 +197,7 @@ Universe list (sorted by OI) and a single-coin snapshot with `changes` for 1h/4h
 ```
 
 Where each block comes from, and what the flags mean:
-- **`liquidations`** — exact trailing-window totals from raw fills (same numbers as `/v1/perps/liquidations`): `ntlUsd`, `events` (forced orders), `fills` (raw prints), and `wallets` (distinct traders liquidated — the "how many traders got liquidated" number; a trader hit several times counts once, and the top-level `wallets` can be less than longs + shorts because one wallet can be liquidated both ways in a window). `dominantSide` is `shorts`/`longs` when one side is ≥ 60% of liquidated notional, else `balanced` (`none` when nothing was liquidated).
+- **`liquidations`** — exact trailing-window totals from raw fills (same numbers as `/v1/perps/liquidations`): `ntlUsd`, `events` (forced orders), `fills` (raw prints), and `traders` (distinct wallets liquidated — the "how many traders got liquidated" number; a trader hit several times counts once, and the top-level `traders` can be less than longs + shorts because one wallet can be liquidated both ways in a window). `dominantSide` is `shorts`/`longs` when one side is ≥ 60% of liquidated notional, else `balanced` (`none` when nothing was liquidated).
 - **`price` / `openInterest` change** — now vs. the recorded tick nearest `now − window`, identical to `/changes` (so `null` until the window has history). `windowHigh`/`windowLow` come from the 5m candles plus the live tick.
 - **`allTimeHigh`** — from Hyperliquid's own daily candles (the full listing history, fetched once per coin per 5 minutes; `null` if the fetch fails or the coin has no candles). `isNewInWindow` is true when a high above every prior high printed inside the window; the pre-window part of the day that straddles the window start is resolved from our 5m candles, so a window shorter than a day still gets a precise answer. `pctBelowAth` is the current price's distance from the high (`0` = at the high); `flags.nearAllTimeHigh` = within 5%.
 - **`openInterest.record`** — the highest OI **this service has recorded** (1h candles are kept forever, so the record deepens the longer the collector runs — `recordedSince`/`recordedDays` say how deep it is). `isRecordHigh` is true when that record was set inside the window — the "open interest reaches its highest level on Hyperliquid" claim.
@@ -264,20 +264,31 @@ Honest semantics — read this before charting it:
              "totalNtlUsd": 4476123.75, "events": 44 }] }
 ```
 
-### `GET /v1/perps/liquidations?windows=1h,24h`
-**The liquidation board** — per-coin totals over trailing windows plus the venue-wide sum, in one response: "how many liquidations in the past hour / day, for every coin". Params: `windows` (comma list, `15m`…`{LIQ_RETENTION_DAYS}d`, default `1h,24h`), `sort` (`ntl|events`, applied to the first window), `dir`, `limit`. Windows are computed exactly from raw fills, not bucket-aligned. Each total carries `events` (forced orders), `fills` (raw prints), and `wallets` (distinct traders liquidated; the venue-wide `totals` count each wallet once across coins).
+### `GET /v1/perps/liquidations?windows=1h,4h,12h,24h`
+**The liquidation board** — per-coin totals over trailing windows plus the venue-wide sum, in one response: everything a "liquidation heatmap" page needs (treemap sized by notional and coloured by long/short, the 1h/4h/12h/24h "Rekt" cards, traders liquidated, the largest single order) plus a ready-made one-line narrative per coin and window. Params: `windows` (comma list, `15m`…`{LIQ_RETENTION_DAYS}d`, default `1h,24h`), `sort` (`ntl|events`, applied to the first window), `dir`, `limit`. Windows are computed exactly from raw fills, not bucket-aligned. Each side block carries `ntlUsd`, `events` (forced orders), `fills` (raw prints), and `traders` (distinct wallets liquidated on that side).
 
 ```json
 { "windows": ["1h", "24h"], "lastLiqAt": "2026-08-30T17:09:58.664Z", "count": 37,
-  "totals": { "1h":  { "longs": { "ntlUsd": 12007.9, "events": 2, "fills": 2, "wallets": 2 },
-                        "shorts": { "ntlUsd": 861204.1, "events": 55, "fills": 240, "wallets": 41 },
-                        "totalNtlUsd": 873212.0, "events": 57, "wallets": 43 },
+  "totals": { "1h":  { "longs": { "ntlUsd": 1160000, "events": 12, "fills": 31, "traders": 11 },
+                        "shorts": { "ntlUsd": 4650000, "events": 155, "fills": 640, "traders": 178 },
+                        "totalNtlUsd": 5810000, "events": 167, "traders": 187,
+                        "largest": { "coin": "BTC", "ntlUsd": 1240000, "side": "short", "px": 63210.5, "fills": 6,
+                                     "wallet": "0x…", "explorer": "https://app.hyperliquid.xyz/explorer/address/0x…",
+                                     "t": "2026-08-30T16:52:10.114Z", "tMs": 1788108730114 },
+                        "headline": "$4.65M of shorts liquidated in the last 1h — 187 traders liquidated, largest single order BTC $1.24M" },
               "24h": { "...": "same shape" } },
-  "data": [{ "coin": "BTC", "windows": { "1h": { "...": "..." }, "24h": { "...": "..." } } }] }
+  "data": [{ "coin": "BTC",
+             "windows": { "1h": { "longs": { "...": "..." }, "shorts": { "...": "..." }, "totalNtlUsd": 2310000, "events": 41, "traders": 38,
+                                  "largest": { "ntlUsd": 1240000, "side": "short", "px": 63210.5, "fills": 6, "wallet": "0x…", "explorer": "…", "t": "…", "tMs": 0 },
+                                  "px": { "now": 63480.0, "then": 62050.0, "changePct": 2.31, "thenTs": "2026-08-30T16:09:45.000Z" },
+                                  "headline": "$2.10M of BTC shorts liquidated as BTC moved +2.31% in the last 1h — 38 traders liquidated, largest single order $1.24M" },
+                          "24h": { "...": "..." } } }] }
 ```
 
+Per coin and window: `traders` is the number of distinct wallets liquidated (in `totals` it is venue-wide distinct wallets, not the sum — one wallet liquidated on BTC and ETH in a cascade is one trader); `largest` is the single biggest forced liquidation order (all fills of one forced order share a wallet and timestamp; `px` is the notional-weighted fill price; `null` when nothing was liquidated); `px` is the coin's price move over the same window from the recorded ticks (`null` for windows longer than `RAW_RETENTION_DAYS`, where no reference tick survives); `headline` is the narrative string — the dominant side leads, the other side is added when it is at least a quarter of the total, and the move is included when known. It says *liquidated*, not "stopped or liquidated": stop orders are private and nothing public distinguishes a stop-out from any other trade. All numbers are the recorder's floors (see coverage notes below).
+
 ### `GET /v1/perps/:coin/liquidations/recent` · `GET /v1/market/liquidations/recent`
-The raw liquidation tape, newest first: `{t, side, px, sz, ntlUsd, wallet, method, tid}` (`side` = which side got liquidated; `wallet` = the liquidated address — public on-chain data; `method` = `market` for order-book liquidations, `backstop` for liquidator-vault takeovers). `/v1/perps/:coin` also carries a `liquidations` block with 1h/24h totals inline (notional, forced orders, fills, and distinct wallets per side).
+The raw liquidation tape, newest first: `{t, side, px, sz, ntlUsd, wallet, method, tid}` (`side` = which side got liquidated; `wallet` = the liquidated address — public on-chain data; `method` = `market` for order-book liquidations, `backstop` for liquidator-vault takeovers). `/v1/perps/:coin` also carries a `liquidations` block with 1h/24h totals inline (notional, forced orders, fills, and distinct traders, per side and overall).
 
 How this works — and its honest semantics (Hyperliquid has **no** liquidation feed):
 - **Detection.** Forced closes print on the public trades WebSocket looking exactly like normal trades (same shape, real hash — verified empirically; the all-zero-hash prints are TWAP fills, not liquidations). But a wallet's fills from `userFillsByTime` carry an explicit `liquidation` marker on **both parties** of a liquidation print, naming the liquidated wallet. So the recorder classifies tape trades by verifying wallets: one paced request classifies *every* trade that wallet touched in the window.
@@ -359,7 +370,7 @@ Semantics:
 - Rule changes take effect on the next collector boot. Coin names are Hyperliquid's exact spelling (`BTC`, `ETH`, `kPEPE`); an unknown coin is logged as a warning rather than silently never firing.
 
 ### `GET /v1/market/liquidations/whales`
-**Large liquidated accounts.** Every wallet whose liquidations in one burst add up to at least `LIQ_WHALE_THRESHOLD` ($10M by default), newest first, with what got liquidated. A burst is one wallet's liquidation fills, across all coins, with no gap longer than `LIQ_WHALE_WINDOW` — so a position taken down in several partial liquidations over a few minutes is one record, and a wallet liquidated on BTC and ETH in the same cascade is one record with both. Params: `wallet`, `coin`, `since`, `minNtlUsd`, `active` (`true` = burst still going), `limit` (default 50, max 500).
+**Large liquidated accounts.** Every wallet whose liquidations in one burst add up to at least `LIQ_WHALE_THRESHOLD` ($10M by default), newest first, with what got liquidated, how the price moved into it, and whether the position is gone entirely — enough for "Whale 0x1234…abcd's entire $6M BTC long was liquidated as BTC moved −3.2%". A burst is one wallet's liquidation fills, across all coins, with no gap longer than `LIQ_WHALE_WINDOW` — so a position taken down in several partial liquidations over a few minutes is one record, and a wallet liquidated on BTC and ETH in the same cascade is one record with both. Params: `wallet`, `coin`, `since`, `minNtlUsd`, `active` (`true` = burst still going), `limit` (default 50, max 500).
 
 ```json
 { "count": 1,
@@ -367,13 +378,21 @@ Semantics:
              "detectedAt": "2026-09-02T15:20:41.002Z", "from": "2026-09-02T15:18:02.113Z", "to": "2026-09-02T15:20:19.870Z",
              "toMs": 1788362419870, "durationSec": 138,
              "ntlUsd": 13000000, "thresholdUsd": 10000000, "events": 3, "fills": 9,
-             "coins": [{ "coin": "BTC", "side": "long", "ntlUsd": 6000000, "events": 1, "fills": 4 },
-                       { "coin": "ETH", "side": "long", "ntlUsd": 7000000, "events": 2, "fills": 5 }],
+             "coins": [{ "coin": "ETH", "side": "long", "ntlUsd": 7000000, "events": 2, "fills": 5,
+                         "px": { "before1h": 3312.4, "atStart": 3230.1, "atEnd": 3205.8, "movePct": -3.22, "burstMovePct": -0.75 },
+                         "remainingSz": 0, "remainingNtlUsd": 0, "fullyLiquidated": true },
+                       { "coin": "BTC", "side": "long", "ntlUsd": 6000000, "events": 1, "fills": 4,
+                         "px": { "...": "..." }, "remainingSz": 31.2, "remainingNtlUsd": 1980000, "fullyLiquidated": false }],
+             "stateAfter": { "checkedAt": "2026-09-02T16:21:05.410Z", "accountValueUsd": 412000, "totalNtlPosUsd": 1980000,
+                             "positions": [{ "coin": "BTC", "side": "long", "sz": 31.2, "entryPx": 64100.0, "ntlUsd": 1980000 }] },
+             "headline": "Whale 0x1234…abcd's entire $7.00M ETH long was liquidated as ETH moved −3.22% into the liquidation, plus $6.00M across 1 other coin",
              "active": false, "delivered": true, "deliveryError": null }] }
 ```
 
 Semantics:
-- **Records grow while the burst is open.** A wallet is recorded the moment its burst crosses the threshold (and pushed to the webhook once, as `🐋 …`); further liquidations within the window fold into the same record (`ntlUsd`, `events`, `coins`, `to` update) until the window passes with no new fills, then it freezes. Later liquidations of the same wallet start a new record.
+- **Records grow while the burst is open.** A wallet is recorded the moment its burst crosses the threshold (and pushed to the webhook once, as `🐋 …` with the same `headline`); further liquidations within the window fold into the same record (`ntlUsd`, `events`, `coins`, `to` update) until the window passes with no new fills, then it freezes. Later liquidations of the same wallet start a new record.
+- **Price context** comes from this service's own ticks (5m candles once ticks are pruned): per coin, the price 1h before the burst's first fill (`before1h`), at the first fill (`atStart`) and at the latest fill (`atEnd`); `movePct` is `before1h → atEnd` — the move that took the position down — and `burstMovePct` is the move during the burst itself. `null` where no price was recorded (collector down over that hour).
+- **"Entire position"** is decided from one `clearinghouseState` fetch of the wallet when the episode is detected and again when it closes (`stateAfter`, with the wallet's remaining book): a coin is `fullyLiquidated` when the wallet no longer holds anything on the liquidated side (flat, or flipped); otherwise `remainingSz` / `remainingNtlUsd` say what survived. `null` on records from before this was collected or when the fetch failed.
 - **Late discovery still counts.** The tracker keys on when fills were recorded, not when they traded, so liquidations the recorder classifies late or backfills after downtime are collected too (a burst older than the window is recorded already closed).
 - Wallets are public on-chain addresses; `explorer` links to Hyperliquid's own explorer. Totals are the recorder's floors (see coverage notes above) — a large liquidation is exactly the flow the verification queue prioritises, so these are caught reliably in practice.
 ### `GET /v1/whales/new?window=1h&minUsd=1000000`
