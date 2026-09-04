@@ -495,29 +495,49 @@ export interface LiqTotalsRow {
   coin: string;
   long_ntl: number;
   short_ntl: number;
-  long_events: number;
+  long_events: number; // forced orders (distinct wallet × timestamp)
   short_events: number;
-  long_fills: number;
+  long_fills: number; // raw prints
   short_fills: number;
+  long_wallets: number; // distinct traders liquidated on that side
+  short_wallets: number;
+  wallets: number; // distinct traders either side (≤ long + short: one wallet can be hit both ways)
 }
+
+const LIQ_TOTAL_COLS = `
+  coalesce(sum(ntl) filter (where side = 'long'), 0) as long_ntl,
+  coalesce(sum(ntl) filter (where side = 'short'), 0) as short_ntl,
+  (count(distinct (wallet, ts)) filter (where side = 'long'))::int as long_events,
+  (count(distinct (wallet, ts)) filter (where side = 'short'))::int as short_events,
+  (count(*) filter (where side = 'long'))::int as long_fills,
+  (count(*) filter (where side = 'short'))::int as short_fills,
+  (count(distinct wallet) filter (where side = 'long'))::int as long_wallets,
+  (count(distinct wallet) filter (where side = 'short'))::int as short_wallets,
+  count(distinct wallet)::int as wallets`;
 
 // Per-coin liquidation totals over a trailing window, from raw fills (exact windows,
 // bounded by LIQ_RETENTION_DAYS). coin = null returns every coin with liquidations.
 export async function liqTotals(windowMs: number, coin: string | null): Promise<LiqTotalsRow[]> {
   const { rows } = await pool.query<LiqTotalsRow>(
-    `select coin,
-       coalesce(sum(ntl) filter (where side = 'long'), 0) as long_ntl,
-       coalesce(sum(ntl) filter (where side = 'short'), 0) as short_ntl,
-       (count(distinct (wallet, ts)) filter (where side = 'long'))::int as long_events,
-       (count(distinct (wallet, ts)) filter (where side = 'short'))::int as short_events,
-       (count(*) filter (where side = 'long'))::int as long_fills,
-       (count(*) filter (where side = 'short'))::int as short_fills
+    `select coin, ${LIQ_TOTAL_COLS}
      from liq_fills
      where ts >= now() - make_interval(secs => $1) and ($2::text is null or coin = $2)
      group by coin`,
     [windowMs / 1000, coin],
   );
   return rows;
+}
+
+// Venue-wide totals over a trailing window. Not derivable from the per-coin rows:
+// distinct wallets don't sum across coins (one trader liquidated in BTC and ETH is one trader).
+export async function liqVenueTotals(windowMs: number): Promise<LiqTotalsRow> {
+  const { rows } = await pool.query<LiqTotalsRow>(
+    `select '*' as coin, ${LIQ_TOTAL_COLS}
+     from liq_fills
+     where ts >= now() - make_interval(secs => $1)`,
+    [windowMs / 1000],
+  );
+  return rows[0]!;
 }
 
 export interface LiqFillRow {

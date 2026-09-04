@@ -22,6 +22,7 @@ import {
   listWhaleAlerts,
   liqCandles,
   liqTotals,
+  liqVenueTotals,
   marketCandles,
   marketOiCloseAt,
   perpCandles,
@@ -224,19 +225,21 @@ function serializeLiqCandle(r: LiqCandleRow): Record<string, unknown> {
 }
 
 const ZERO_LIQ_TOTALS = {
-  longs: { ntlUsd: 0, events: 0, fills: 0 },
-  shorts: { ntlUsd: 0, events: 0, fills: 0 },
+  longs: { ntlUsd: 0, events: 0, fills: 0, wallets: 0 },
+  shorts: { ntlUsd: 0, events: 0, fills: 0, wallets: 0 },
   totalNtlUsd: 0,
   events: 0,
+  wallets: 0,
 };
 
 function serializeLiqTotals(r: LiqTotalsRow | undefined): Record<string, unknown> {
   if (!r) return ZERO_LIQ_TOTALS;
   return {
-    longs: { ntlUsd: r.long_ntl, events: r.long_events, fills: r.long_fills },
-    shorts: { ntlUsd: r.short_ntl, events: r.short_events, fills: r.short_fills },
+    longs: { ntlUsd: r.long_ntl, events: r.long_events, fills: r.long_fills, wallets: r.long_wallets },
+    shorts: { ntlUsd: r.short_ntl, events: r.short_events, fills: r.short_fills, wallets: r.short_wallets },
     totalNtlUsd: r.long_ntl + r.short_ntl,
     events: r.long_events + r.short_events,
+    wallets: r.wallets,
   };
 }
 
@@ -1080,20 +1083,8 @@ export function registerRoutes(app: FastifyInstance): void {
     const ranked = [...coins]
       .sort((a, b) => (rank(byWindow[0]!.get(a)) - rank(byWindow[0]!.get(b))) * sign || a.localeCompare(b))
       .slice(0, limit);
-    const totals = Object.fromEntries(
-      windows.map((w, i) => {
-        const agg: LiqTotalsRow = { coin: "*", long_ntl: 0, short_ntl: 0, long_events: 0, short_events: 0, long_fills: 0, short_fills: 0 };
-        for (const r of perWindow[i]!) {
-          agg.long_ntl += r.long_ntl;
-          agg.short_ntl += r.short_ntl;
-          agg.long_events += r.long_events;
-          agg.short_events += r.short_events;
-          agg.long_fills += r.long_fills;
-          agg.short_fills += r.short_fills;
-        }
-        return [w.name, serializeLiqTotals(agg)];
-      }),
-    );
+    const venue = await Promise.all(windows.map((w) => liqVenueTotals(w.ms)));
+    const totals = Object.fromEntries(windows.map((w, i) => [w.name, serializeLiqTotals(venue[i])]));
     return {
       windows: windows.map((w) => w.name),
       lastLiqAt: lastAt ? lastAt.toISOString() : null,
