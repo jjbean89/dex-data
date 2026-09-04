@@ -499,6 +499,7 @@ export interface LiqTotalsRow {
   short_events: number;
   long_fills: number;
   short_fills: number;
+  traders: number; // distinct wallets liquidated
 }
 
 // Per-coin liquidation totals over a trailing window, from raw fills (exact windows,
@@ -511,11 +512,48 @@ export async function liqTotals(windowMs: number, coin: string | null): Promise<
        (count(distinct (wallet, ts)) filter (where side = 'long'))::int as long_events,
        (count(distinct (wallet, ts)) filter (where side = 'short'))::int as short_events,
        (count(*) filter (where side = 'long'))::int as long_fills,
-       (count(*) filter (where side = 'short'))::int as short_fills
+       (count(*) filter (where side = 'short'))::int as short_fills,
+       count(distinct wallet)::int as traders
      from liq_fills
      where ts >= now() - make_interval(secs => $1) and ($2::text is null or coin = $2)
      group by coin`,
     [windowMs / 1000, coin],
+  );
+  return rows;
+}
+
+// Distinct wallets liquidated venue-wide over a trailing window. Not the sum of the
+// per-coin counts: one wallet liquidated on BTC and ETH in a cascade is one trader.
+export async function liqVenueTraders(windowMs: number): Promise<number> {
+  const { rows } = await pool.query<{ n: number }>(
+    `select count(distinct wallet)::int as n from liq_fills where ts >= now() - make_interval(secs => $1)`,
+    [windowMs / 1000],
+  );
+  return rows[0]?.n ?? 0;
+}
+
+export interface LiqLargestRow {
+  coin: string;
+  wallet: string;
+  ts: Date;
+  side: string;
+  ntl: number;
+  px: number; // notional-weighted fill price
+  fills: number;
+}
+
+// Per coin, the single largest forced liquidation order in the window — one forced
+// order is every fill sharing (wallet, ts). The venue-wide largest is the max of these.
+export async function liqLargestOrders(windowMs: number): Promise<LiqLargestRow[]> {
+  const { rows } = await pool.query<LiqLargestRow>(
+    `select distinct on (coin) coin, wallet, ts, side, ntl, px, fills from (
+       select coin, wallet, ts, min(side) as side, sum(ntl) as ntl,
+              sum(ntl) / nullif(sum(sz), 0) as px, count(*)::int as fills
+       from liq_fills
+       where ts >= now() - make_interval(secs => $1)
+       group by coin, wallet, ts
+     ) o order by coin, ntl desc, ts desc`,
+    [windowMs / 1000],
   );
   return rows;
 }
