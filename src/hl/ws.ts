@@ -17,10 +17,18 @@ interface TradesFeedOpts {
   onTrades: (trades: WsTrade[]) => void;
   // Called after reconnecting from an outage long enough that fills were missed.
   onGap: (gapMs: number) => void;
+  // Force a reconnect when no trade message has arrived for this long while the
+  // socket is open (default TRADE_STALE_MS). Exposed for tests.
+  tradeStaleMs?: number;
 }
 
 const PING_INTERVAL_MS = 30_000;
 const STALE_MS = 75_000;
+// Across every live perp the tape prints many trades a second, so silence on
+// the trades channel while the socket is open means the server dropped our
+// subscriptions — it still answers pings, so the message watchdog alone never
+// notices. Reconnecting resubscribes; the gap is reported from the last trade.
+const TRADE_STALE_MS = 120_000;
 const COIN_REFRESH_MS = 300_000; // new listings are rare; a few minutes' pickup delay is fine
 const GAP_NOTIFY_MS = 30_000;
 
@@ -32,6 +40,7 @@ export class TradesFeed {
   private stopped = false;
   private subscribed = new Set<string>();
   private lastMessageAt = 0;
+  private lastTradeAt = 0;
   private disconnectedAt: number | null = null;
   private reconnectDelay = 1_000;
   private timers: NodeJS.Timeout[] = [];
@@ -53,10 +62,18 @@ export class TradesFeed {
 
   private connect(): void {
     if (this.stopped) return;
-    const ws = new WebSocket(this.opts.url);
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(this.opts.url);
+    } catch (err) {
+      logErr("trades-ws", "connect failed", err);
+      this.scheduleReconnect();
+      return;
+    }
     this.ws = ws;
     ws.onopen = () => {
       this.lastMessageAt = Date.now();
+      this.lastTradeAt = Date.now();
       this.reconnectDelay = 1_000;
       this.subscribed.clear();
       if (this.disconnectedAt !== null) {
@@ -75,7 +92,12 @@ export class TradesFeed {
       } catch {
         return;
       }
-      if (msg.channel === "trades" && Array.isArray(msg.data)) this.opts.onTrades(msg.data);
+      if (msg.channel === "trades" && Array.isArray(msg.data)) {
+        this.lastTradeAt = Date.now();
+        this.opts.onTrades(msg.data);
+      } else if (msg.channel === "error") {
+        logErr("trades-ws", `server error: ${String((msg as { data?: unknown }).data).slice(0, 200)}`);
+      }
     };
     ws.onclose = () => this.scheduleReconnect();
     ws.onerror = () => {
@@ -98,10 +120,21 @@ export class TradesFeed {
 
   private checkStale(): void {
     if (this.stopped || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    if (Date.now() - this.lastMessageAt > STALE_MS) {
-      logErr("trades-ws", "no messages for 75s, forcing reconnect");
-      this.ws.close();
+    const now = Date.now();
+    if (now - this.lastMessageAt > STALE_MS) {
+      this.forceReconnect("no messages for 75s", this.lastMessageAt);
+    } else if (this.subscribed.size > 0 && now - this.lastTradeAt > (this.opts.tradeStaleMs ?? TRADE_STALE_MS)) {
+      this.forceReconnect(`no trades for ${Math.round((now - this.lastTradeAt) / 1000)}s with ${this.subscribed.size} subscriptions`, this.lastTradeAt);
     }
+  }
+
+  // Close the socket so the reconnect path resubscribes. The outage is dated
+  // from `silentSince`, not from the close, so consumers backfill the whole
+  // silent stretch rather than the one-second reconnect.
+  private forceReconnect(reason: string, silentSince: number): void {
+    logErr("trades-ws", `${reason}, forcing reconnect`);
+    if (this.disconnectedAt === null) this.disconnectedAt = silentSince;
+    this.ws?.close();
   }
 
   private async refreshCoins(): Promise<void> {
