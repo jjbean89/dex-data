@@ -669,7 +669,7 @@ export function registerRoutes(app: FastifyInstance): void {
       "GET /v1/perps/emas?tf=1h,4h,12h,1d&coins=&minOiUsd=0&limit=500",
       "GET /v1/perps/:coin",
       "GET /v1/perps/:coin/recap?window=24h",
-      "GET /v1/perps/recaps?window=24h&sort=oi|volumeChange|px&dir=desc&limit=5&minOiUsd=5000000&minVolumeUsd=1000000&minLiqUsd=500000",
+      "GET /v1/perps/recaps?window=24h&sort=oi|volumeChange|px&dir=desc&limit=5&minOiUsd=5000000&minVolumeUsd=1000000&minLiqUsd=0",
       "GET /v1/perps/:coin/emas",
       "GET /v1/perps/:coin/candles?interval=5m|1h|1d&from=&to=&limit=300",
       "GET /v1/perps/:coin/funding-history?from=&to=&limit=168",
@@ -1002,8 +1002,8 @@ export function registerRoutes(app: FastifyInstance): void {
 
   // Ranked recaps: the top-N movers by OI / volume / price change over a window,
   // each with its full recap — the "what are the five biggest OI gainers doing"
-  // feed in one request. Floors default to $5M OI, $1M 24h volume, and $500K
-  // liquidated over the window — a mover nobody got liquidated on is not a story.
+  // feed in one request. Floors default to $5M OI and $1M 24h volume; an optional
+  // liquidation floor (minLiqUsd, off by default) drops movers nobody got hit on.
   app.get("/v1/perps/recaps", async (req, reply) => {
     const q = req.query as Query;
     const windowRaw = q.window ?? "24h";
@@ -1030,7 +1030,7 @@ export function registerRoutes(app: FastifyInstance): void {
     if (!Number.isFinite(minOiUsd)) return bad(reply, "invalid minOiUsd");
     const minVolumeUsd = q.minVolumeUsd !== undefined && q.minVolumeUsd !== "" ? Number(q.minVolumeUsd) : 1_000_000;
     if (!Number.isFinite(minVolumeUsd)) return bad(reply, "invalid minVolumeUsd");
-    const minLiqUsd = q.minLiqUsd !== undefined && q.minLiqUsd !== "" ? Number(q.minLiqUsd) : 500_000;
+    const minLiqUsd = q.minLiqUsd !== undefined && q.minLiqUsd !== "" ? Number(q.minLiqUsd) : 0;
     if (!Number.isFinite(minLiqUsd)) return bad(reply, "invalid minLiqUsd");
 
     const [bundle, liqRows] = await Promise.all([
