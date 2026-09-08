@@ -669,7 +669,7 @@ export function registerRoutes(app: FastifyInstance): void {
       "GET /v1/perps/emas?tf=1h,4h,12h,1d&coins=&minOiUsd=0&limit=500",
       "GET /v1/perps/:coin",
       "GET /v1/perps/:coin/recap?window=24h",
-      "GET /v1/perps/recaps?window=24h&sort=oi|volumeChange|px&dir=desc&limit=5&minOiUsd=1000000&minVolumeUsd=1000000",
+      "GET /v1/perps/recaps?window=24h&sort=oi|volumeChange|px&dir=desc&limit=5&minOiUsd=5000000&minVolumeUsd=1000000&minLiqUsd=500000",
       "GET /v1/perps/:coin/emas",
       "GET /v1/perps/:coin/candles?interval=5m|1h|1d&from=&to=&limit=300",
       "GET /v1/perps/:coin/funding-history?from=&to=&limit=168",
@@ -1002,7 +1002,8 @@ export function registerRoutes(app: FastifyInstance): void {
 
   // Ranked recaps: the top-N movers by OI / volume / price change over a window,
   // each with its full recap — the "what are the five biggest OI gainers doing"
-  // feed in one request. Floors default to $1M OI and $1M 24h volume.
+  // feed in one request. Floors default to $5M OI, $1M 24h volume, and $500K
+  // liquidated over the window — a mover nobody got liquidated on is not a story.
   app.get("/v1/perps/recaps", async (req, reply) => {
     const q = req.query as Query;
     const windowRaw = q.window ?? "24h";
@@ -1025,16 +1026,25 @@ export function registerRoutes(app: FastifyInstance): void {
     if (dir !== "asc" && dir !== "desc") return bad(reply, 'dir must be "asc" or "desc"');
     const limit = parseLimit(q.limit, 5, RECAPS_LIMIT_MAX);
     if (limit === null) return bad(reply, `invalid limit — use 1..${RECAPS_LIMIT_MAX}`);
-    const minOiUsd = q.minOiUsd !== undefined && q.minOiUsd !== "" ? Number(q.minOiUsd) : 1_000_000;
+    const minOiUsd = q.minOiUsd !== undefined && q.minOiUsd !== "" ? Number(q.minOiUsd) : 5_000_000;
     if (!Number.isFinite(minOiUsd)) return bad(reply, "invalid minOiUsd");
     const minVolumeUsd = q.minVolumeUsd !== undefined && q.minVolumeUsd !== "" ? Number(q.minVolumeUsd) : 1_000_000;
     if (!Number.isFinite(minVolumeUsd)) return bad(reply, "invalid minVolumeUsd");
+    const minLiqUsd = q.minLiqUsd !== undefined && q.minLiqUsd !== "" ? Number(q.minLiqUsd) : 500_000;
+    if (!Number.isFinite(minLiqUsd)) return bad(reply, "invalid minLiqUsd");
 
-    const bundle = await getChanges(windowMs);
+    const [bundle, liqRows] = await Promise.all([
+      getChanges(windowMs),
+      cached(`liq:totals:${windowMs}`, CACHE_MS, () => liqTotals(windowMs, null)),
+    ]);
     if (!bundle.asOf) return noRecentData(reply);
+    const liqBy = new Map(liqRows.map((r) => [r.coin, r.long_ntl + r.short_ntl]));
+    const eligible = bundle.rows.filter(
+      (r) => (r.oiUsd ?? 0) >= minOiUsd && (r.dayNtlVlm ?? 0) >= minVolumeUsd && (liqBy.get(r.coin) ?? 0) >= minLiqUsd,
+    );
     const sign = dir === "desc" ? -1 : 1;
-    const ranked = bundle.rows
-      .filter((r) => (r.oiUsd ?? 0) >= minOiUsd && (r.dayNtlVlm ?? 0) >= minVolumeUsd && sorter(r) !== null)
+    const ranked = eligible
+      .filter((r) => sorter(r) !== null)
       .sort((a, b) => (sorter(a)! - sorter(b)!) * sign || a.coin.localeCompare(b.coin))
       .slice(0, limit);
 
@@ -1055,7 +1065,8 @@ export function registerRoutes(app: FastifyInstance): void {
       dir,
       minOiUsd,
       minVolumeUsd,
-      eligible: bundle.rows.filter((r) => (r.oiUsd ?? 0) >= minOiUsd && (r.dayNtlVlm ?? 0) >= minVolumeUsd).length,
+      minLiqUsd,
+      eligible: eligible.length,
       count: data.length,
       data,
     };
