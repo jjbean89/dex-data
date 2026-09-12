@@ -278,8 +278,9 @@ export const config = {
   mcapTopN: numEnv("MCAP_TOP_N", 10),
   mcapIgnoreIds: listEnv("MCAP_IGNORE_IDS", MCAP_DEFAULT_IGNORE_IDS),
   mcapBackfill: process.env.MCAP_BACKFILL !== "false",
-  // Public/demo keys can read at most 365 days of history; pro keys can read everything.
-  mcapBackfillDays: backfillDaysEnv(cgPlan === "pro" ? "max" : 365),
+  // Daily history imported before the recorder existed. Public/demo keys can read
+  // at most 365 days; "max" (everything, pro keys only) is opt-in.
+  mcapBackfillDays: backfillDaysEnv(200),
   // Without /global/market_cap_chart (pro only), total history is rebuilt from
   // this many top coins' histories scaled to /global coverage. 0 disables.
   mcapApproxCoins: numEnv("MCAP_APPROX_COINS", 250),

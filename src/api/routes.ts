@@ -688,7 +688,7 @@ export function registerRoutes(app: FastifyInstance): void {
       "GET /v1/whales/alerts?kind=funded|positioned&address=&since=&limit=100",
       "GET /v1/marketcap",
       "GET /v1/marketcap/:index  (total|total2|total3|others)",
-      "GET /v1/marketcap/:index/candles?interval=1h|4h|12h|1d|1w&from=&to=&limit=365&ema=21,200",
+      "GET /v1/marketcap/:index/candles?interval=1h|4h|12h|1d|1w&from=&to=&limit=200&ema=21,200",
     ],
   }));
 
