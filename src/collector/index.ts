@@ -14,6 +14,7 @@ import { collectTick } from "./ticks.js";
 import { startVolumeRecorder } from "./volume.js";
 import { startVolumeSignals } from "./volume-signals.js";
 import { startLiqWhaleTracker } from "./liq-whales.js";
+import { startMarketcap } from "./marketcap.js";
 import { startWhaleTracker } from "./whales.js";
 
 const RETENTION_INTERVAL_MS = 3_600_000;
@@ -177,9 +178,10 @@ export function startCollector(): () => Promise<void> {
     if (config.volSignalsEnabled) stops.push(startVolumeSignals(isStopped));
   }
   if (config.whalesEnabled) stops.push(startWhaleTracker(isStopped, tape));
+  if (config.marketcapEnabled) stops.push(startMarketcap(isStopped));
   log(
     "collector",
-    `started: poll ${config.pollIntervalMs}ms, funding sweep every ${Math.round(config.fundingSyncIntervalMs / 60_000)}min, backfill ${config.fundingBackfillDays}d, positions ${config.positionsEnabled ? "on" : "off"}, liquidations ${config.liquidationsEnabled ? "on" : "off"}, liq alerts ${config.liquidationsEnabled && config.liqAlertsEnabled ? `${config.liqAlertRules.length} rules` : "off"}, liq whales ${config.liquidationsEnabled && config.liqWhaleThresholdUsd > 0 ? `≥ $${config.liqWhaleThresholdUsd / 1e6}M` : "off"}, volume ${config.volumeEnabled ? `on${config.volSignalsEnabled ? " + signals" : ""}` : "off"}, emas ${config.emasEnabled ? `${config.emaPeriods.join("/")} × ${config.emaTimeframes.join("/")}` : "off"}, bridge whales ${config.whalesEnabled ? `≥$${config.whaleMinUsd.toLocaleString("en-US")}/${config.whaleWindowHours}h` : "off"}`,
+    `started: poll ${config.pollIntervalMs}ms, funding sweep every ${Math.round(config.fundingSyncIntervalMs / 60_000)}min, backfill ${config.fundingBackfillDays}d, positions ${config.positionsEnabled ? "on" : "off"}, liquidations ${config.liquidationsEnabled ? "on" : "off"}, liq alerts ${config.liquidationsEnabled && config.liqAlertsEnabled ? `${config.liqAlertRules.length} rules` : "off"}, liq whales ${config.liquidationsEnabled && config.liqWhaleThresholdUsd > 0 ? `≥ $${config.liqWhaleThresholdUsd / 1e6}M` : "off"}, volume ${config.volumeEnabled ? `on${config.volSignalsEnabled ? " + signals" : ""}` : "off"}, emas ${config.emasEnabled ? `${config.emaPeriods.join("/")} × ${config.emaTimeframes.join("/")}` : "off"}, bridge whales ${config.whalesEnabled ? `≥$${config.whaleMinUsd.toLocaleString("en-US")}/${config.whaleWindowHours}h` : "off"}, market caps ${config.marketcapEnabled ? `coingecko ${config.coingeckoPlan}` : "off"}`,
   );
 
   return async () => {

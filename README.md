@@ -15,6 +15,7 @@ Custom Hyperliquid market data service. Hyperliquid's public API only exposes th
 - **Volume-leading-price signals** — abnormal volume while price is still flat, confirmed by open-interest growth or one-sided taker flow: the accumulation that precedes a move, with breakout confirmation after the fact
 - **EMAs for every coin on every timeframe** — EMA 21/200 on 1h/4h/12h/1d (all configurable), seeded from full candle history to match TradingView, plus the screener columns derived from them (price-vs-EMA %, EMA-vs-EMA cross spread) in one response
 - **New whale wallets** — every wallet that bridged $1M+ (configurable) into Hyperliquid in the last hour, whether the account is brand new, and whether it has opened a position since (with the positions, and which of them were held before the money arrived) — from the Arbitrum bridge's deposit logs joined to per-wallet Hyperliquid state; Hyperliquid's own API has no deposit feed at all. Each new whale, and the first large position it opens after funding, can be pushed to Discord/Slack
+- **Global market-cap indexes** — the CRYPTOCAP series TradingView charts as **TOTAL / TOTAL2 / TOTAL3 / OTHERS** (everything, ex-BTC, ex-BTC+ETH, ex-top-10), as daily OHLC candles with volume and EMA 21/200, plus 1h/4h/12h/1w — built from CoinGecko: recorded live every 15 minutes, with the past 200 days backfilled (configurable) so the chart is complete from day one
 
 One process polls `metaAndAssetCtxs` (every live perp in a single request) every 15s, rolls ticks up into 5m/1h candles, prunes raw data on a retention schedule, runs the trades-WebSocket position tracker, and polls the Arbitrum bridge for incoming deposits. A second process serves a read-only JSON API.
 
@@ -127,6 +128,14 @@ Deploys are zero-drama: the collector shuts down gracefully on SIGTERM and the D
 | `WHALE_FUNDED_MAX_AGE_HOURS` | `24` | `funded` alerts only for wallets whose first-ever Hyperliquid activity is this recent |
 | `HYPERTRACKER_API_KEY` | — | Enables the one-time starting-census import (see positioning docs below) |
 | `HYPERTRACKER_BASE_URL` / `HYPERTRACKER_REQ_DELAY_MS` | `https://ht-api.coinmarketman.com/api` / `1500` | Census source + pacing |
+| `MARKETCAP_ENABLED` | `true` | Global market-cap index recorder (see `/v1/marketcap`) |
+| `COINGECKO_API_KEY` / `COINGECKO_PLAN` | — / `auto` | Optional CoinGecko key and plan (`public`, `demo`, `pro`; `auto` = demo with a key, else public). Public ≈ 5–15 req/min and 365 days of history; a free Demo key gives 30 req/min; Pro unlocks exact total-cap history back to 2013 |
+| `COINGECKO_API_URL` / `COINGECKO_REQ_DELAY_MS` | by plan | Base URL override; pacing between requests (public 7000, demo 2500, pro 250) |
+| `MCAP_POLL_MS` | `900000` | Snapshot cadence — two CoinGecko requests per poll (≈ 5.8k calls/month at 15min) |
+| `MCAP_TOP_N` / `MCAP_IGNORE_IDS` | `10` / wrapped & staked duplicates | OTHERS excludes the top N coins by market cap; ids in the ignore list never count as top-N coins (add `tether,usd-coin` for an ex-stablecoin OTHERS) |
+| `MCAP_BACKFILL` / `MCAP_BACKFILL_DAYS` | `true` / `200` | Import this many days of daily history from before the recorder existed (public/demo keys serve up to 365; `max` = everything, pro keys only) and refill days lost to downtime. EMA 200 needs 200 closes before it draws, so use 400+ to have it span the chart |
+| `MCAP_APPROX_COINS` | `250` | Without a pro key the total's history is rebuilt from this many top coins' histories scaled to today's `/global` coverage (`0` = no total history) |
+| `MCAP_SNAPSHOT_RETENTION_DAYS` | `400` | Raw snapshot retention (feeds the intraday intervals); daily candles are kept forever |
 | `PG_SSL_NO_VERIFY` | `false` | Accept self-signed Postgres TLS (Railway public proxy) |
 
 ## API
@@ -447,6 +456,33 @@ Every alert is logged (`[whales] ALERT …`), stored, and — with `LIQ_ALERT_WE
 ### `GET /v1/bridge/deposits?window=24h&minUsd=100000`
 The raw deposit tape behind the whale board, newest first: `{t, address, usdc, txHash, logIndex, block}` for every recorded bridge deposit ≥ `minUsd` in the window (default `100000`; anything down to `BRIDGE_MIN_RECORD_USD` is available). Same `bridge` freshness block as above.
 
+### `GET /v1/marketcap` · `GET /v1/marketcap/:index` · `GET /v1/marketcap/:index/candles`
+**Global crypto market-cap indexes**, the feeds behind a TradingView `CRYPTOCAP:TOTAL3` / `CRYPTOCAP:OTHERS` chart, built from CoinGecko:
+
+| index | is | TradingView symbol |
+|---|---|---|
+| `total` | every coin CoinGecko tracks | `TOTAL` |
+| `total2` | total − BTC | `TOTAL2` |
+| `total3` | total − BTC − ETH | `TOTAL3` |
+| `others` | total − the top 10 coins by market cap (stablecoins included, wrapped/staked duplicates skipped; `MCAP_TOP_N` / `MCAP_IGNORE_IDS`) | `OTHERS` |
+
+`GET /v1/marketcap` is the live board: every index's `marketCapUsd`, `volume24hUsd`, `change24hPct/7dPct/30dPct`, BTC/ETH dominance, the current top-10 ids (`top.ids`, what OTHERS excludes), the snapshot's `asOf`/`ageSec`/`stale`, and how much history is on disk. `GET /v1/marketcap/:index` is the same for one index.
+
+`GET /v1/marketcap/:index/candles?interval=1h|4h|12h|1d|1w&from=&to=&limit=200&ema=21,200` returns the chart series, ascending, the most recent `limit` (max 5000) within `from`/`to`:
+
+```json
+{ "index": "total3", "name": "Crypto Total Market Cap Excluding BTC and ETH", "interval": "1d", "vs": "usd", "ema": [21, 200], "count": 200,
+  "data": [ { "t": "2026-09-11T00:00:00.000Z", "tMs": 1789084800000,
+              "o": 1270751466868, "h": 1270751466868, "l": 1270751466868, "c": 1270751466868, "v": 60044016869,
+              "source": "coingecko", "ema": { "21": 1353014621750, "200": 1336626313475 } }, … ] }
+```
+
+- `o/h/l/c` are USD market cap, `v` is USD volume: the day's 24h volume on `1d`, summed over the week on `1w`, the trailing-24h figure at the bucket's close on intraday intervals.
+- `ema` (default `21,200`, up to six periods, `ema=none` to skip) is computed over the *entire* stored series before the window is cut, so the values match a chart that has all the history loaded. Each period's EMA is `null` until its SMA seed is complete, the way `ta.ema` behaves.
+- `source` says where a candle came from: `recorded` (built from live snapshots — real intraday OHLC), `coingecko` (backfilled from CoinGecko history: close-only, `o=h=l=c`), or `approx` (close-only, total reconstructed from the top `MCAP_APPROX_COINS` coins' histories scaled to today's coverage — what non-pro keys get). Weekly candles mixing sources say `mixed`.
+- `1d` and `1w` come from the daily table (backfilled history + recorded days); `1h/4h/12h` are bucketed from the snapshots, so they exist from the day the recorder started, for `MCAP_SNAPSHOT_RETENTION_DAYS`.
+- Days are UTC. A CoinGecko history point stamped `00:00 UTC` is the value at that instant, i.e. the close of the *previous* day, and is stored that way, so backfilled closes line up with recorded ones.
+
 ### `GET /health`
 `{ok, lastTickAt, tickAgeSec, ticksStale, liveCoins}` — wire this to Railway's healthcheck.
 
@@ -456,6 +492,7 @@ The raw deposit tape behind the whale board, newest first: `{t, address, usdc, t
 - **Funding is hourly on Hyperliquid.** `funding_hr` on ticks is the live predicted rate; `funding-history` is the settled ledger. Early history (pre-mid-2023) settled every 8h — rows carry whatever HL reports.
 - **Delisted coins** stop ticking but keep their history; new listings are picked up automatically on the next tick.
 - **Retention:** raw ticks 14d → 5m candles 180d → 1h candles forever (volume: 1m bars 30d, 5m 180d, 1h forever). `/changes` windows are bounded by raw retention; longer lookbacks come from the candle endpoints.
+- **Market-cap history:** OTHERS history is built with *today's* top-10 membership all the way back (TradingView rebalances its constituents periodically; the difference is a few percent at most and vanishes once days are recorded live). History is imported 200 days deep by default (`MCAP_BACKFILL_DAYS`). Without a pro CoinGecko key the total's history is an approximation — the sum of the top 250 coins' daily caps, scaled by their share of `/global` today — flagged `source: "approx"` per candle; recorded days are exact on every plan.
 - **Scale:** ~176 live coins × 4 ticks/min ≈ 1M rows/day raw, pruned at 14d ≈ 14M rows steady-state — comfortable for stock Postgres. If you later want years of raw ticks, TimescaleDB is a drop-in upgrade (deploy the `timescale/timescaledb` image as a Railway service instead of managed Postgres).
 - **Redundancy:** OI can't be backfilled, so if this becomes commercial, run a second collector against a second DB (different egress IP) as insurance.
 - **Cost levers**, in descending order of impact, if the Railway bill needs trimming: keep `DATABASE_URL` on the private network (see above); `POSITIONS_ENABLED=false` drops the wallet bootstrapper and the two largest tables (the WebSocket firehose stays if liquidations are on); `LIQUIDATIONS_ENABLED=false` drops the liquidation recorder and its verification traffic; `WHALES_ENABLED=false` drops the bridge watcher (no HL budget to speak of, but one fewer external dependency); `POLL_INTERVAL_MS=30000` halves raw-tick volume and write load with candles still built from 10 ticks per 5m bucket; `REVERIFY_BATCH` scales the background clearinghouseState traffic; `RAW_RETENTION_DAYS` bounds the biggest table. Everything already in place — watermarked rollups, batched writes, response compression, capped retention — needs no tuning.
