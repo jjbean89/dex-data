@@ -53,7 +53,8 @@ import {
 import { serializeWhaleCoin, whaleHeadline } from "../collector/liq-whales.js";
 import { formatUsd } from "../collector/webhook.js";
 import { buildRecap } from "./recap.js";
-import { aprPct, cached, parseLimit, parseTimeMs, parseWindow, pctChange, rollingMean } from "./util.js";
+import { registerMarketcapRoutes } from "./marketcap.js";
+import { aprPct, bad, cached, notFound, parseLimit, parseTimeMs, parseWindow, pctChange, rollingMean } from "./util.js";
 
 type Query = Record<string, string | undefined>;
 
@@ -62,14 +63,6 @@ const CANDLE_LIMIT_MAX = 5_000;
 const BUCKET_MS: Record<CandleInterval, number> = { "5m": 300_000, "1h": 3_600_000, "1d": 86_400_000 };
 const CHANGE_WINDOWS = ["1h", "4h", "24h"] as const;
 const RECAPS_LIMIT_MAX = 20; // each recap is several queries plus a cached HL candle fetch
-
-function bad(reply: FastifyReply, message: string): FastifyReply {
-  return reply.code(400).send({ error: { code: "bad_request", message } });
-}
-
-function notFound(reply: FastifyReply, message: string): FastifyReply {
-  return reply.code(404).send({ error: { code: "not_found", message } });
-}
 
 function noRecentData(reply: FastifyReply): FastifyReply {
   return reply
@@ -693,8 +686,13 @@ export function registerRoutes(app: FastifyInstance): void {
       "GET /v1/whales/new?window=1h&minUsd=1000000&positioned=true|false&newOnly=false&limit=100",
       "GET /v1/bridge/deposits?window=24h&minUsd=100000&limit=100",
       "GET /v1/whales/alerts?kind=funded|positioned&address=&since=&limit=100",
+      "GET /v1/marketcap",
+      "GET /v1/marketcap/:index  (total|total2|total3|others)",
+      "GET /v1/marketcap/:index/candles?interval=1h|4h|12h|1d|1w&from=&to=&limit=365&ema=21,200",
     ],
   }));
+
+  registerMarketcapRoutes(app);
 
   // Volume board: every coin's relative volume over the last N 5m bars against
   // its own baseline, with the flatness/positioning numbers the detector uses —

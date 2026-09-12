@@ -1,3 +1,13 @@
+import type { FastifyReply } from "fastify";
+
+export function bad(reply: FastifyReply, message: string): FastifyReply {
+  return reply.code(400).send({ error: { code: "bad_request", message } });
+}
+
+export function notFound(reply: FastifyReply, message: string): FastifyReply {
+  return reply.code(404).send({ error: { code: "not_found", message } });
+}
+
 // Parse "5m" / "1h" / "24h" / "3d" style windows into milliseconds. Returns null when invalid.
 export function parseWindow(raw: string): number | null {
   const m = /^(\d{1,3})(m|h|d)$/.exec(raw);

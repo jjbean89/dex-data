@@ -119,6 +119,32 @@ export function parseLiqAlertRules(raw: string): LiqAlertRule[] {
   return [...out.values()];
 }
 
+// CoinGecko plan → base URL + key header. "auto" = demo when a key is set, else public.
+export type CoinGeckoPlan = "public" | "demo" | "pro";
+
+function coingeckoPlan(): CoinGeckoPlan {
+  const raw = (process.env.COINGECKO_PLAN ?? "auto").trim().toLowerCase();
+  if (raw === "auto" || raw === "") return process.env.COINGECKO_API_KEY?.trim() ? "demo" : "public";
+  if (raw === "public" || raw === "demo" || raw === "pro") return raw;
+  throw new Error(`COINGECKO_PLAN must be one of auto|public|demo|pro, got "${raw}"`);
+}
+
+// Wrapped / liquid-staked duplicates that CoinGecko ranks inside the top ~15 by
+// market cap but that TradingView's OTHERS does not count as top-10 coins.
+export const MCAP_DEFAULT_IGNORE_IDS =
+  "wrapped-bitcoin,staked-ether,wrapped-steth,weth,wrapped-eeth,coinbase-wrapped-btc,wrapped-beacon-eth,rocket-pool-eth,binance-bridged-usdt-bnb-smart-chain";
+
+function backfillDaysEnv(def: number | "max"): number | "max" {
+  const raw = process.env.MCAP_BACKFILL_DAYS?.trim();
+  if (raw === undefined || raw === "") return def;
+  if (raw.toLowerCase() === "max") return "max";
+  const v = Number(raw);
+  if (!Number.isFinite(v)) throw new Error(`env MCAP_BACKFILL_DAYS must be a number of days or "max", got "${raw}"`);
+  return v;
+}
+
+const cgPlan = coingeckoPlan();
+
 export const config = {
   role: (process.env.ROLE ?? "all") as Role,
   databaseUrl: process.env.DATABASE_URL ?? "",
@@ -239,6 +265,26 @@ export const config = {
   // 'funded' alerts only for fresh wallets: first-ever Hyperliquid ledger entry within this many hours.
   whaleFundedMaxAgeHours: numEnv("WHALE_FUNDED_MAX_AGE_HOURS", 24),
 
+  // Global market-cap indexes (TOTAL / TOTAL2 / TOTAL3 / OTHERS) from CoinGecko.
+  marketcapEnabled: process.env.MARKETCAP_ENABLED !== "false",
+  coingeckoApiKey: process.env.COINGECKO_API_KEY?.trim() ?? "",
+  coingeckoPlan: cgPlan,
+  coingeckoApiUrl:
+    process.env.COINGECKO_API_URL?.trim().replace(/\/+$/, "") ||
+    (cgPlan === "pro" ? "https://pro-api.coingecko.com/api/v3" : "https://api.coingecko.com/api/v3"),
+  // Pacing between CoinGecko requests: public ≈ 5–15 req/min (no key), demo 30/min, pro 500/min.
+  coingeckoReqDelayMs: numEnv("COINGECKO_REQ_DELAY_MS", cgPlan === "pro" ? 250 : cgPlan === "demo" ? 2_500 : 7_000),
+  mcapPollMs: numEnv("MCAP_POLL_MS", 900_000),
+  mcapTopN: numEnv("MCAP_TOP_N", 10),
+  mcapIgnoreIds: listEnv("MCAP_IGNORE_IDS", MCAP_DEFAULT_IGNORE_IDS),
+  mcapBackfill: process.env.MCAP_BACKFILL !== "false",
+  // Public/demo keys can read at most 365 days of history; pro keys can read everything.
+  mcapBackfillDays: backfillDaysEnv(cgPlan === "pro" ? "max" : 365),
+  // Without /global/market_cap_chart (pro only), total history is rebuilt from
+  // this many top coins' histories scaled to /global coverage. 0 disables.
+  mcapApproxCoins: numEnv("MCAP_APPROX_COINS", 250),
+  mcapSnapshotRetentionDays: numEnv("MCAP_SNAPSHOT_RETENTION_DAYS", 400),
+
   pgSslNoVerify: process.env.PG_SSL_NO_VERIFY === "true",
 };
 
@@ -356,6 +402,24 @@ export function assertConfig(): void {
     if (config.emaReqDelayMs < 500) {
       throw new Error("EMA_REQ_DELAY_MS below 500ms risks the Hyperliquid rate-limit budget during seeding sweeps");
     }
+  }
+  if (config.marketcapEnabled) {
+    if (!/^https?:\/\//.test(config.coingeckoApiUrl)) throw new Error("COINGECKO_API_URL must be an http(s) URL");
+    if (config.coingeckoPlan === "pro" && config.coingeckoApiKey === "") {
+      throw new Error("COINGECKO_PLAN=pro needs COINGECKO_API_KEY");
+    }
+    if (config.coingeckoReqDelayMs < 100) throw new Error("COINGECKO_REQ_DELAY_MS must be at least 100");
+    if (config.mcapPollMs < 60_000) throw new Error("MCAP_POLL_MS below 60000ms would burn the CoinGecko rate-limit budget");
+    if (!Number.isInteger(config.mcapTopN) || config.mcapTopN < 1 || config.mcapTopN > 100) {
+      throw new Error("MCAP_TOP_N must be an integer between 1 and 100");
+    }
+    if (config.mcapBackfillDays !== "max" && (config.mcapBackfillDays < 91 || config.mcapBackfillDays > 10_000)) {
+      throw new Error('MCAP_BACKFILL_DAYS must be between 91 and 10000, or "max" (CoinGecko serves daily points only past 90 days)');
+    }
+    if (!Number.isInteger(config.mcapApproxCoins) || config.mcapApproxCoins < 0 || config.mcapApproxCoins > 1_000) {
+      throw new Error("MCAP_APPROX_COINS must be an integer between 0 and 1000");
+    }
+    if (config.mcapSnapshotRetentionDays < 2) throw new Error("MCAP_SNAPSHOT_RETENTION_DAYS must be at least 2");
   }
   // Railway bills every byte through the public TCP proxy as egress; the collector
   // talks to Postgres constantly, so that misconfiguration quietly gets expensive.
